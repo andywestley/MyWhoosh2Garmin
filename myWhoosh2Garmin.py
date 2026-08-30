@@ -17,9 +17,14 @@ import sys
 import shutil
 import logging
 from pathlib import Path
+import warnings
 from datetime import datetime
 from getpass import getpass
 from typing import List, Optional
+
+# Suppress library deprecation notices in output
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -318,19 +323,40 @@ def process_and_spoof_fit_file(
 
         # 1. Device Spoofing: File ID message
         if isinstance(message, FileIdMessage):
-            message.manufacturer = Manufacturer.GARMIN.value
-            message.product = GarminProduct.EDGE_1030_PLUS.value
+            try:
+                message.manufacturer = Manufacturer.GARMIN.value
+            except Exception:
+                pass
+            try:
+                message.product = GarminProduct.EDGE_1030_PLUS.value
+            except Exception:
+                pass
             if hasattr(message, "garmin_product"):
-                message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+                try:
+                    message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+                except Exception:
+                    pass
 
         # 2. Device Spoofing: Device Info message
         elif isinstance(message, DeviceInfoMessage):
-            has_device_info = True
-            message.manufacturer = Manufacturer.GARMIN.value
-            message.product = GarminProduct.EDGE_1030_PLUS.value
-            message.product_name = "Edge 1030 Plus"
+            try:
+                message.manufacturer = Manufacturer.GARMIN.value
+            except Exception:
+                pass
+            try:
+                message.product = GarminProduct.EDGE_1030_PLUS.value
+            except Exception:
+                pass
             if hasattr(message, "garmin_product"):
-                message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+                try:
+                    message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+                except Exception:
+                    pass
+            try:
+                message.product_name = "Edge 1030 Plus"
+            except Exception:
+                pass
+
 
         # 3. Lap Message Accumulation
         elif isinstance(message, LapMessage):
@@ -367,17 +393,6 @@ def process_and_spoof_fit_file(
 
         builder.add(message)
 
-
-
-    # If no DeviceInfoMessage was in the file, inject one for Garmin Connect
-    if not has_device_info:
-        dev_msg = DeviceInfoMessage()
-        dev_msg.manufacturer = Manufacturer.GARMIN.value
-        dev_msg.product = GarminProduct.EDGE_1030_PLUS.value
-        dev_msg.product_name = "Edge 1030 Plus"
-        dev_msg.device_index = 0
-        builder.add(dev_msg)
-
     try:
         output_fit_path.parent.mkdir(parents=True, exist_ok=True)
         builder.build().to_file(str(output_fit_path))
@@ -386,6 +401,7 @@ def process_and_spoof_fit_file(
     except Exception as e:
         logger.error(f"Failed to write processed FIT file {output_fit_path.name}: {e}")
         return False
+
 
 
 def archive_file(source_file: Path, archive_dir: Path) -> Optional[Path]:
@@ -423,7 +439,10 @@ def upload_fit_file_to_garmin(file_path: Path) -> bool:
         if "409" in str(e) or "duplicate" in str(e).lower():
             logger.warning(f"Activity {file_path.name} already exists on Garmin Connect (duplicate detected).")
             return True
-        logger.error(f"Garmin HTTP upload error for {file_path.name}: {e}")
+        err_detail = ""
+        if hasattr(e, "error") and hasattr(e.error, "response") and e.error.response is not None:
+            err_detail = f" | Details: {e.error.response.text}"
+        logger.error(f"Garmin HTTP upload error for {file_path.name}: {e}{err_detail}")
         return False
     except Exception as e:
         logger.error(f"Garmin upload failed for {file_path.name}: {e}")
@@ -478,7 +497,7 @@ def main():
     try:
         for fit_path in pending_files:
             logger.info(f"Processing '{fit_path.name}'...")
-            temp_output = temp_dir / f"spoofed_{fit_path.name}"
+            temp_output = temp_dir / fit_path.name
 
             # Process, check athlete profile, and spoof as Garmin Edge 1030 Plus
             processed = process_and_spoof_fit_file(
@@ -486,6 +505,7 @@ def main():
                 output_fit_path=temp_output,
                 expected_profile=MYWHOOSH_PROFILE_NAME if MYWHOOSH_PROFILE_NAME else None,
             )
+
 
             if not processed:
                 # File was skipped due to profile mismatch or parsing failure
