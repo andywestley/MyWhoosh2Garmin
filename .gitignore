@@ -2,3 +2,7 @@
 *.log
 *.json
 *.lock
+.env
+__pycache__/
+*.pyc
+Archive/

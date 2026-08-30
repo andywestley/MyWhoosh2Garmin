@@ -1,203 +1,146 @@
-<h1 align="center" id="title">myWhoosh2Garmin</h1>
+<h1 align="center" id="title">MyWhoosh2Garmin</h1>
 
-<h2>🧐Features</h2>
+<p align="center">
+  <b>Automated, silent sync between MyWhoosh and Garmin Connect with Garmin Edge 1030 Plus spoofing and multi-user support.</b>
+</p>
 
-*   Finds the .fit files from your MyWhoosh installation.
-*   Fix the missing power & heart rate averages.
-*   Removes the temperature.
-*   Create a backup file to a folder you select.
-*   Uploads the fixed .fit file to Garmin Connect.
+---
 
-<h2>🛠️ Installation Steps:</h2>
+## 🧐 Features
 
-<p>1. Download myWhoosh2Garmin.py to your filesystem to a folder or your choosing.</p>
+* **Device Spoofing:** Spoofs the device in the `.fit` file to a **Garmin Edge 1030 Plus** (Garmin manufacturer ID `1`, product ID `3570`). This unlocks Garmin Connect cycling dynamics, training effect, and training status calculations.
+* **Automated Path Discovery:** Automatically searches `%LOCALAPPDATA%` (e.g. `AppData\Local\MyWhoosh\Saved\Workouts` and Microsoft Store package directories) without hardcoding paths.
+* **Secure Credentials via `.env`:** Stores Garmin Connect credentials securely using `python-dotenv`. Saves session tokens in `.garth/` for fast recurring logins.
+* **Duplicate Prevention & Archiving:** Automatically moves processed and uploaded `.fit` files to an `Archive/` subfolder so they are never processed twice.
+* **Multi-User Profile Filtering:** If multiple athletes use the same machine/MyWhoosh install, you can specify `MYWHOOSH_PROFILE_NAME` in `.env` to prevent other people's workouts from being uploaded to your Garmin account.
+* **Robust Logging:** Records all synchronization runs, authentication events, profile checks, and error messages to `sync.log`.
+* **Silent Windows Background Execution:** Includes a `run_sync_silent.vbs` wrapper script for Windows Task Scheduler to run silently in the background without terminal pop-ups.
 
-<p>2. Go to the folder where you downloaded the script in a shell.</p>
+---
 
-- <b>MacOS:</b> Terminal of your choice. 
-- <b>Windows:</b> Start > Run > cmd or Start > Run > powershell
+## 🛠️ Windows Deployment & Setup Guide
 
-<p>3. Install `pipenv` (if not already installed):</p>
+### 1. Prerequisites
 
-```
-pip3 install pipenv
-or
-pip install pipenv
-```
-<p>4. Install dependencies in a virtual envioronment:</p>
+* **Python 3.10+** installed on the target machine.
+  > During Python installation, ensure you check **"Add Python to PATH"**.
+* **Git** (or download and extract the repository ZIP).
 
-```
-pipenv install
-```
+### 2. Clone or Copy the Repository
 
-<p>5. Activate the virtual environment:</p>
-
-```
-pipenv shell
+```cmd
+git clone https://github.com/andywestley/MyWhoosh2Garmin.git
+cd MyWhoosh2Garmin
 ```
 
-<p>5. Run the script:</p>
+### 3. Install Dependencies
 
+Install the required packages using the included `requirements.txt`:
+
+```cmd
+pip install -r requirements.txt
 ```
-python3 myWhoosh2Garmin.py
-or
+
+*(Dependencies: `garth`, `fit_tool`, `python-dotenv`)*
+
+### 4. Configure `.env`
+
+Copy `.env.example` to `.env`:
+
+```cmd
+copy .env.example .env
+```
+
+Open `.env` in Notepad or any text editor and fill in your details:
+
+```env
+# Garmin Connect Credentials
+GARMIN_EMAIL=your_email@example.com
+GARMIN_PASSWORD=your_secure_password
+
+# Multi-User Filter (Optional)
+# Enter your MyWhoosh athlete/display name.
+# If set, activities belonging to other profiles will be skipped.
+MYWHOOSH_PROFILE_NAME=YourAthleteName
+
+# Path Overrides (Optional - leave blank for auto-detection)
+MYWHOOSH_WORKOUTS_DIR=
+ARCHIVE_DIR=
+```
+
+### 5. Run an Initial Test
+
+Run the Python script once manually from the command prompt to verify your credentials and path discovery:
+
+```cmd
 python myWhoosh2Garmin.py
 ```
-  
-<p>6. Choose your backup folder.</p>
 
-<h3>MacOS</h3>
+Check `sync.log` to confirm successful execution:
 
-![image](https://github.com/user-attachments/assets/2c6c1072-bacf-4f0c-8861-78f62bf51648)
-
-
-<h3>Windows</h3>
-
-
-![image](https://github.com/user-attachments/assets/d1540291-4e6d-488e-9dcf-8d7b68651103)
-
-<p>7. Enter your Garmin Connect credentials</p>
-
-```
-2024-11-21 10:08:04,014 No existing session. Please log in.
-Username: <YOUR_EMAIL>
-Password:
-2024-11-21 10:08:33,545 Authenticating...
-
-2024-11-21 10:08:37,107 Successfully authenticated!
+```cmd
+type sync.log
 ```
 
-<p>8. Run the script when you're done riding or running.</p>
+---
+
+## 🕒 Setting Up Windows Task Scheduler (Silent Background Sync)
+
+To run the sync automatically and silently after workouts:
+
+### Option A: Recurring Schedule (e.g., Every 15 or 30 Minutes)
+
+1. Open **Task Scheduler** (press `Win + R`, type `taskschd.msc`, and press Enter).
+2. Click **Create Task...** in the right-hand panel.
+3. **General Tab:**
+   * **Name:** `MyWhoosh2Garmin Silent Sync`
+   * **Security Options:** Select **"Run only when user is logged on"** (or "Run whether user is logged on or not").
+4. **Triggers Tab:**
+   * Click **New...**
+   * **Begin the task:** *On a schedule* (e.g. Daily).
+   * Check **"Repeat task every:"** and select `15 minutes` (or `30 minutes`) for a duration of `Indefinitely`.
+5. **Actions Tab:**
+   * Click **New...**
+   * **Action:** *Start a program*
+   * **Program/script:** `wscript.exe`
+   * **Add arguments:** `"C:\path\to\MyWhoosh2Garmin\run_sync_silent.vbs"`
+   * **Start in:** `C:\path\to\MyWhoosh2Garmin`
+6. Click **OK** to save the task.
+
+### Option B: Trigger When MyWhoosh Closes
+
+You can also trigger a task when the `mywhoosh.exe` process terminates, or use the provided PowerShell helper script.
+
+---
+
+## 📁 Directory Structure
 
 ```
-2024-11-21 10:08:37,107 Checking for .fit files in directory: <YOUR_MYWHOOSH_DIR_WITH_FITFILES>.
-2024-11-21 10:08:37,107 Found the most recent .fit file: MyNewActivity-3.8.5.fit.
-2024-11-21 10:08:37,107 Cleaning up <YOUR_BACKUP_FOLDER>yNewActivity-3.8.5_2024-11-21_100837.fit.
-2024-11-21 10:08:37,855 Cleaned-up file saved as <YOUR_BACKUP_FOLDER>MyNewActivity-3.8.5_2024-11-21_100837.fit
-2024-11-21 10:08:37,871 Successfully cleaned MyNewActivity-3.8.5.fit and saved it as MyNewActivity-3.8.5_2024-11-21_100837.fit.
-2024-11-21 10:08:38,408 Duplicate activity found on Garmin Connect.
+MyWhoosh2Garmin/
+├── .env                  # Your private credentials & configuration (git-ignored)
+├── .env.example          # Template configuration
+├── .gitignore            # Git ignore rules for logs, tokens, and archives
+├── myWhoosh2Garmin.py    # Main synchronization and FIT spoofing engine
+├── requirements.txt      # Python package dependencies
+├── run_sync_silent.vbs   # Silent wrapper script for Task Scheduler
+├── sync.log              # Rolling execution log file
+└── Archive/              # Destination folder for processed/uploaded .fit files
 ```
 
-<p>(9. Or see below to automate the process)</p>
+---
 
-<h2>ℹ️ Automation tips</h2> 
+## 🔍 How Multi-User Profile Detection Works
 
-What if you want to automate the whole process:
-<h3>MacOS</h3>
+When MyWhoosh finishes an activity, it writes the athlete's friendly name to the `UserProfileMessage` in the `.fit` file.
 
-PowerShell on MacOS (Verified & works)
+* If `MYWHOOSH_PROFILE_NAME` is configured in `.env`, the script reads this message before modifying or uploading the file.
+* If the name does not match the configured profile, the script logs a warning in `sync.log` and safely skips the file.
+* If `MYWHOOSH_PROFILE_NAME` is blank, all `.fit` files in the directory are processed.
 
-You need Powershell
+---
 
-```shell
-brew install powershell/tap/powershell
-```
+## 📜 Credits & License
 
-```powershell
-# Define the JSON config file path
-$configFile = "$PSScriptRoot\mywhoosh_config.json"
-$myWhooshApp = "myWhoosh Indoor Cycling App.app"
-
-# Check if the JSON file exists and read the stored path
-if (Test-Path $configFile) {
-    $config = Get-Content -Path $configFile | ConvertFrom-Json
-    $mywhooshPath = $config.path
-} else {
-    $mywhooshPath = $null
-}
-
-# Validate the stored path
-if (-not $mywhooshPath -or -not (Test-Path $mywhooshPath)) {
-    Write-Host "Searching for $myWhooshApp"
-    $mywhooshPath = Get-ChildItem -Path "/Applications" -Filter $myWhooshApp -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-
-    if (-not $mywhooshPath) {
-        Write-Host " not found!"
-        exit 1
-    }
-
-    $mywhooshPath = $mywhooshPath.FullName
-
-    # Store the path in the JSON file
-    $config = @{ path = $mywhooshPath }
-    $config | ConvertTo-Json | Set-Content -Path $configFile
-}
-
-Write-Host "Found $myWhooshApp at $mywhooshPath"
-
-Start-Process -FilePath $mywhooshPath
-
-# Wait for the application to finish
-Write-Host "Waiting for $myWhooshApp to finish..."
-while ($process = ps -ax | grep -i $myWhooshApp | grep -v "grep") {
-    Write-Output $process
-    Start-Sleep -Seconds 5
-}
-
-# Run the Python script
-Write-Host "$myWhooshApp has finished, running Python script..."
-python3 "<PATH_WHERE_YOUR_SCRIPT_IS_LOCATED>/MyWhoosh2Garmin/myWhoosh2Garmin.py"
-```
-
-AppleScript (need to test further)
-
-```applescript
-TODO: needs more work
-```
-
-<h3>Windows</h3>
-
-Windows .ps1 (PowerShell) file (Untested on Windows)
-```powershell
-# Define the JSON config file path
-$configFile = "$PSScriptRoot\mywhoosh_config.json"
-
-# Check if the JSON file exists and read the stored path
-if (Test-Path $configFile) {
-    $config = Get-Content -Path $configFile | ConvertFrom-Json
-    $mywhooshPath = $config.path
-} else {
-    $mywhooshPath = $null
-}
-
-# Validate the stored path
-if (-not $mywhooshPath -or -not (Test-Path $mywhooshPath)) {
-    Write-Host "Searching for mywhoosh.exe..."
-    $mywhooshPath = Get-ChildItem -Path "C:\PROGRAM FILES" -Filter "mywhoosh.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-
-    if (-not $mywhooshPath) {
-        Write-Host "mywhoosh.exe not found!"
-        exit 1
-    }
-
-    $mywhooshPath = $mywhooshPath.FullName
-
-    # Store the path in the JSON file
-    $config = @{ path = $mywhooshPath }
-    $config | ConvertTo-Json | Set-Content -Path $configFile
-}
-
-Write-Host "Found mywhoosh.exe at $mywhooshPath"
-
-# Start mywhoosh.exe
-Start-Process -FilePath $mywhooshPath
-
-# Wait for the application to finish
-Write-Host "Waiting for mywhoosh to finish..."
-while (Get-Process -Name "mywhoosh" -ErrorAction SilentlyContinue) {
-    Start-Sleep -Seconds 5
-}
-
-# Run the Python script
-Write-Host "mywhoosh has finished, running Python script..."
-python "C:\Path\to\myWhoosh2Garmin.py"
-```
-
-<h2>💻 Built with</h2>
-
-Technologies used in the project:
-
-* Neovim
-*   <a href="https://github.com/matin/garth">Garth</a>
-*   tKinter
-*   <a href="https://bitbucket.org/stagescycling/fit_tool/src/main/">Fit\_tool</a>
+* [Garth by matin](https://github.com/matin/garth) - Garmin Connect authentication and upload API.
+* [fit_tool](https://pypi.org/project/fit-tool/) - FIT file parsing and binary manipulation.
+* License: GPL-3.0

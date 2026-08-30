@@ -1,353 +1,339 @@
 #!/usr/bin/env python3
 """
 Script name: myWhoosh2Garmin.py
-Usage: "python3 myWhoosh2Garmin.py"
-Description:    Checks for MyNewActivity-<myWhooshVersion>.fit
-                Adds avg power and heartrade
-                Removes temperature
-                Creates backup for the file with a timestamp as a suffix
-Credits:        Garth by matin - for authenticating and uploading with 
-                Garmin Connect.
-                https://github.com/matin/garth
-                Fit_tool by mtucker - for parsing the fit file.
-                https://bitbucket.org/stagescycling/python_fit_tool.git/src
-                mw2gc by embeddedc - used as an example to fix the avg's. 
-                https://github.com/embeddedc/mw2gc
+Usage: python myWhoosh2Garmin.py
+Description:
+    1. Scans for MyWhoosh workout .fit files.
+    2. Performs device spoofing so Garmin Connect recognizes the device as a 'Garmin Edge 1030 Plus'.
+    3. Calculates average cadence, power, heart rate if missing, and strips unwanted fields.
+    4. Supports multi-user profile filtering (via MYWHOOSH_PROFILE_NAME in .env).
+    5. Authenticates and uploads to Garmin Connect using Garth.
+    6. Moves processed/uploaded .fit files to an 'Archive' directory to prevent duplicate uploads.
+    7. Logs all events, successes, errors, and auth failures to sync.log.
 """
+
 import os
-import json
-import subprocess
 import sys
+import shutil
 import logging
-import re
-from typing import List
-import tkinter as tk
-from tkinter import filedialog
+from pathlib import Path
 from datetime import datetime
 from getpass import getpass
-from pathlib import Path
-import importlib.util
+from typing import List, Optional
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-log_file_path = SCRIPT_DIR / "myWhoosh2Garmin.log"
-json_file_path = SCRIPT_DIR /  "backup_path.json"
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-file_handler = logging.FileHandler(log_file_path)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+load_dotenv(dotenv_path=SCRIPT_DIR / ".env")
 
+# Configure Logging
+LOG_FILE_PATH = SCRIPT_DIR / "sync.log"
+logger = logging.getLogger("MyWhoosh2Garmin")
+logger.setLevel(logging.INFO)
 
-INSTALLED_PACKAGES_FILE = SCRIPT_DIR / "installed_packages.json"
+# File and Console Handlers
+if not logger.handlers:
+    file_handler = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
 
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
 
-def load_installed_packages():
-    """Load the set of installed packages from a JSON file."""
-    if INSTALLED_PACKAGES_FILE.exists():
-        with INSTALLED_PACKAGES_FILE.open("r") as f:
-            return set(json.load(f))
-    return set()
-
-
-def save_installed_packages(installed_packages):
-    """Save the set of installed packages to a JSON file."""
-    with INSTALLED_PACKAGES_FILE.open("w") as f:
-        json.dump(list(installed_packages), f)
-
-
-def get_pip_command():
-    """Return the pip command if pip is available."""
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        return [sys.executable, "-m", "pip"]
-    except subprocess.CalledProcessError:
-        return None
-
-
-def install_package(package):
-    """Install the specified package using pip."""
-    pip_command = get_pip_command()
-    if pip_command:
-        try:
-            logger.info(f"Installing missing package: {package}.")
-            subprocess.check_call(
-                pip_command + ["install", package]
-            )
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error installing {package}: {e}.")
-    else:
-        logger.debug("pip is not available. Unable to install packages.")
-
-
-def ensure_packages():
-    """Ensure all required packages are installed and tracked."""
-    required_packages = ["garth", "fit_tool"]
-    installed_packages = load_installed_packages()
-
-    for package in required_packages:
-        if package in installed_packages:
-            logger.info(f"Package {package} is already tracked as installed.")
-            continue
-
-        if not importlib.util.find_spec(package):
-            logger.info(f"Package {package} not found."
-                        "Attempting to install...")
-            install_package(package)
-
-        try:
-            __import__(package)
-            logger.info(f"Successfully imported {package}.")
-            installed_packages.add(package)
-        except ModuleNotFoundError:
-            logger.error(f"Failed to import {package} even "
-                         "after installation.")
-
-    save_installed_packages(installed_packages)
-
-
-ensure_packages()
-
-
-# Imports
+# Dependencies
 try:
     import garth
     from garth.exc import GarthException, GarthHTTPError
     from fit_tool.fit_file import FitFile
     from fit_tool.fit_file_builder import FitFileBuilder
-    from fit_tool.profile.messages.file_creator_message import (
-        FileCreatorMessage
-    )
+    from fit_tool.profile.profile_type import Manufacturer, GarminProduct
+    from fit_tool.profile.messages.file_id_message import FileIdMessage
+    from fit_tool.profile.messages.device_info_message import DeviceInfoMessage
+    from fit_tool.profile.messages.user_profile_message import UserProfileMessage
     from fit_tool.profile.messages.record_message import (
         RecordMessage,
-        RecordTemperatureField
+        RecordTemperatureField,
     )
     from fit_tool.profile.messages.session_message import SessionMessage
     from fit_tool.profile.messages.lap_message import LapMessage
 except ImportError as e:
-    logger.error(f"Error importing modules: {e}")
+    logger.critical(f"Missing required dependency: {e}. Please run 'pip install -r requirements.txt'.")
+    sys.exit(1)
+
+TOKENS_PATH = SCRIPT_DIR / ".garth"
+MYWHOOSH_PREFIX_WINDOWS = "MyWhooshTechnologyService."
+
+# Environment Configuration
+GARMIN_EMAIL = os.getenv("GARMIN_EMAIL") or os.getenv("GARMIN_USERNAME")
+GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD")
+MYWHOOSH_PROFILE_NAME = (os.getenv("MYWHOOSH_PROFILE_NAME") or "").strip()
+ENV_WORKOUTS_DIR = (os.getenv("MYWHOOSH_WORKOUTS_DIR") or "").strip()
+ENV_ARCHIVE_DIR = (os.getenv("ARCHIVE_DIR") or "").strip()
 
 
-TOKENS_PATH = SCRIPT_DIR / '.garth'
-FILE_DIALOG_TITLE = "MyWhoosh2Garmin"
-# Fix for https://github.com/JayQueue/MyWhoosh2Garmin/issues/2
-MYWHOOSH_PREFIX_WINDOWS = "MyWhooshTechnologyService." 
-
-
-def get_fitfile_location() -> Path:
+def get_fitfile_location() -> Optional[Path]:
     """
-    Get the location of the FIT file directory based on the operating system.
-
-    Returns:
-        Path: The path to the FIT file directory.
-
-    Raises:
-        RuntimeError: If the operating system is unsupported.
-        SystemExit: If the target path does not exist.
+    Automatically discovers the MyWhoosh workout directory.
+    Uses LOCALAPPDATA environment variable on Windows with fallbacks.
     """
-    if os.name == "posix":  # macOS and Linux
-        target_path = (
-           Path.home()
-           / "Library"
-           / "Containers"
-           / "com.whoosh.whooshgame"
-           / "Data"
-           / "Library"
-           / "Application Support"
-           / "Epic"
-           / "MyWhoosh"
-           / "Content"
-           / "Data"
+    # 1. Custom directory override from .env
+    if ENV_WORKOUTS_DIR:
+        custom_path = Path(ENV_WORKOUTS_DIR).expanduser().resolve()
+        if custom_path.is_dir():
+            logger.info(f"Using configured MyWhoosh workout path from .env: {custom_path}")
+            return custom_path
+        logger.warning(f"Configured MYWHOOSH_WORKOUTS_DIR does not exist: {custom_path}")
+
+    # 2. Windows Path Discovery
+    if os.name == "nt":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            base_local = Path(local_app_data)
+
+            # Standard MyWhoosh install locations
+            standard_candidates = [
+                base_local / "MyWhoosh" / "Saved" / "Workouts",
+                base_local / "MyWhooshHD" / "Saved" / "Workouts",
+                base_local / "MyWhoosh" / "Content" / "Data",
+            ]
+
+            for candidate in standard_candidates:
+                if candidate.is_dir():
+                    logger.info(f"Discovered MyWhoosh directory: {candidate}")
+                    return candidate
+
+            # Windows Store / Package install location
+            packages_path = base_local / "Packages"
+            if packages_path.is_dir():
+                try:
+                    for directory in packages_path.iterdir():
+                        if directory.is_dir() and directory.name.startswith(MYWHOOSH_PREFIX_WINDOWS):
+                            store_candidates = [
+                                directory / "LocalCache" / "Local" / "MyWhoosh" / "Saved" / "Workouts",
+                                directory / "LocalCache" / "Local" / "MyWhoosh" / "Content" / "Data",
+                            ]
+                            for s_cand in store_candidates:
+                                if s_cand.is_dir():
+                                    logger.info(f"Discovered MyWhoosh Store directory: {s_cand}")
+                                    return s_cand
+                except (PermissionError, FileNotFoundError) as e:
+                    logger.warning(f"Error scanning Windows Packages directory: {e}")
+
+        # Fallback check under User Profile
+        user_profile = Path.home() / "AppData" / "Local" / "MyWhoosh" / "Saved" / "Workouts"
+        if user_profile.is_dir():
+            return user_profile
+
+    # 3. POSIX Path Discovery (macOS / Linux)
+    elif os.name == "posix":
+        mac_path = (
+            Path.home()
+            / "Library"
+            / "Containers"
+            / "com.whoosh.whooshgame"
+            / "Data"
+            / "Library"
+            / "Application Support"
+            / "Epic"
+            / "MyWhoosh"
+            / "Content"
+            / "Data"
         )
-        if target_path.is_dir():
-            return target_path
-        else:
-            logger.error(f"Target path {target_path} does not exist. "
-                         "Check your MyWhoosh installation.")
-            sys.exit(1)
-    elif os.name == "nt":  # Windows
+        if mac_path.is_dir():
+            logger.info(f"Discovered MyWhoosh macOS path: {mac_path}")
+            return mac_path
+
+    logger.error("Could not automatically locate MyWhoosh workout directory. Set MYWHOOSH_WORKOUTS_DIR in .env.")
+    return None
+
+
+def get_archive_location(workout_dir: Path) -> Path:
+    """
+    Returns and creates the Archive directory path.
+    """
+    if ENV_ARCHIVE_DIR:
+        archive_path = Path(ENV_ARCHIVE_DIR).expanduser().resolve()
+    else:
+        archive_path = workout_dir / "Archive"
+
+    archive_path.mkdir(parents=True, exist_ok=True)
+    return archive_path
+
+
+def authenticate_to_garmin() -> bool:
+    """
+    Authenticates to Garmin Connect using stored tokens or .env credentials.
+    """
+    # Try resuming existing token session
+    if TOKENS_PATH.exists():
         try:
-            base_path = Path.home() / "AppData" / "Local" / "Packages"
-            for directory in base_path.iterdir():
-                if (directory.is_dir() and 
-                        directory.name.startswith(MYWHOOSH_PREFIX_WINDOWS)):
-                    target_path = (
-                            directory
-                            / "LocalCache"
-                            / "Local"
-                            / "MyWhoosh"
-                            / "Content"
-                            / "Data"
-                )
-            if target_path.is_dir():
-                return target_path
-            else:
-                raise FileNotFoundError(f"No valid MyWhoosh directory found in {target_path}")
-        except FileNotFoundError as e:
-                logger.error(str(e))
-        except PermissionError as e:
-                logger.error(f"Permission denied: {e}")
+            garth.resume(str(TOKENS_PATH))
+            username = getattr(garth.client, "username", None) or "User"
+            logger.info(f"Successfully resumed Garmin session for: {username}")
+            return True
+        except (GarthException, Exception) as e:
+            logger.warning(f"Saved Garmin session token expired or invalid ({e}). Re-authenticating...")
+
+    # Authenticate with credentials from .env
+    if GARMIN_EMAIL and GARMIN_PASSWORD:
+        logger.info(f"Authenticating to Garmin Connect using credentials for: {GARMIN_EMAIL}")
+        try:
+            garth.login(GARMIN_EMAIL, GARMIN_PASSWORD)
+            garth.save(str(TOKENS_PATH))
+            logger.info("Successfully authenticated and saved Garmin session tokens.")
+            return True
+        except GarthHTTPError as e:
+            logger.error(f"Authentication failed: Invalid Garmin credentials in .env ({e}).")
+            return False
         except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-    else:
-        logger.error("Unsupported OS")
-        return Path()
+            logger.error(f"Unexpected authentication error: {e}")
+            return False
+
+    # Interactive Fallback if run manually from console
+    if sys.stdin.isatty():
+        logger.info("No credentials in .env. Prompting for interactive login...")
+        try:
+            username = input("Garmin Username/Email: ").strip()
+            password = getpass("Garmin Password: ")
+            garth.login(username, password)
+            garth.save(str(TOKENS_PATH))
+            logger.info("Successfully authenticated via interactive prompt.")
+            return True
+        except Exception as e:
+            logger.error(f"Interactive authentication failed: {e}")
+            return False
+
+    logger.error("Garmin authentication failed: No valid session token or .env credentials found.")
+    return False
 
 
-def get_backup_path(json_file=json_file_path) -> Path:
+def calculate_avg(values: list) -> int:
+    """Calculates integer average of values, returning 0 if empty."""
+    return round(sum(values) / len(values)) if values else 0
+
+
+def append_value(values: list, message: object, field_name: str) -> None:
+    """Appends field value from message if present and truthy, else 0."""
+    value = getattr(message, field_name, None)
+    values.append(value if value is not None else 0)
+
+
+def reset_values() -> tuple[list, list, list, list]:
+    """Resets metric accumulators."""
+    return [], [], [], []
+
+
+def extract_fit_profile_name(fit_file: FitFile) -> Optional[str]:
     """
-    This function checks if a backup path already exists in a JSON file.
-    If it does, it returns the stored path. If the file does not exist, 
-    it prompts the user to select a directory via a file dialog, saves 
-    the selected path to the JSON file, and returns it.
-
-    Args:
-        json_file (str): Path to the JSON file containing the backup path.
-
-    Returns:
-        str or None: The selected backup path or None if no path was selected.
+    Extracts athlete/profile friendly name from FIT records if present.
     """
-    if os.path.exists(json_file):
-        with open(json_file, 'r') as f:
-            backup_path = json.load(f).get('backup_path')
-        if backup_path and os.path.isdir(backup_path):
-            logger.info(f"Using backup path from JSON: {backup_path}.")
-            return Path(backup_path)
-        else:
-            logger.error("Invalid backup path stored in JSON.")
-            sys.exit(1)
-    else:
-        root = tk.Tk()
-        root.withdraw() 
-        backup_path = filedialog.askdirectory(title=f"Select {FILE_DIALOG_TITLE} "
-                                              "Directory")
-        if not backup_path:
-            logger.info("No directory selected, exiting.")
-            return Path()
-        with open(json_file, 'w') as f:
-            json.dump({'backup_path': backup_path}, f)
-        logger.info(f"Backup path saved to {json_file}.")
-    return Path(backup_path)
+    for record in fit_file.records:
+        msg = record.message
+        if isinstance(msg, UserProfileMessage):
+            name = getattr(msg, "friendly_name", None) or getattr(msg, "name", None)
+            if name:
+                return str(name).strip()
+    return None
 
-FITFILE_LOCATION = get_fitfile_location()
-BACKUP_FITFILE_LOCATION = get_backup_path()
 
-def get_credentials_for_garmin():
+def safe_update_session_message(
+    orig_msg: SessionMessage, avg_cadence: int, avg_power: int, avg_hr: int
+) -> SessionMessage:
     """
-    Prompt the user for Garmin credentials and authenticate using Garth.
-
-    Returns:
-        None
-
-    Exits:
-        Exits with status 1 if authentication fails.
+    Safely copies fields from an existing SessionMessage to a new mutable SessionMessage
+    and fills in calculated average cadence, power, and heart rate if not present.
     """
-    username = input("Username: ")
-    password = getpass("Password: ")
-    logger.info("Authenticating...")
-    try:
-        garth.login(username, password)
-        garth.save(TOKENS_PATH)
-        print()
-        logger.info("Successfully authenticated!")
-    except GarthHTTPError:
-        logger.info("Wrong credentials. Please check username and password.")
-        sys.exit(1)
-
-
-def authenticate_to_garmin():
-    """
-    Authenticate the user to Garmin by checking for existing tokens and 
-    resuming the session, or prompting for credentials if no session 
-    exists or the session is expired.
-
-    Returns:
-        None
-
-    Exits:
-        Exits with status 1 if authentication fails.
-    """
-    try:
-        if TOKENS_PATH.exists():
-            garth.resume(TOKENS_PATH)
+    new_msg = SessionMessage()
+    for fld in orig_msg.fields:
+        if fld.is_valid():
             try:
-                logger.info(f"Authenticated as: {garth.client.username}")
-            except GarthException:
-                logger.info("Session expired. Re-authenticating...")
-                get_credentials_for_garmin()
+                new_msg.get_field(fld.id).set_values(fld.get_values())
+            except Exception:
+                pass
+
+    if not getattr(new_msg, "avg_cadence", None) and avg_cadence:
+        try:
+            new_msg.avg_cadence = avg_cadence
+        except Exception:
+            pass
+
+    if not getattr(new_msg, "avg_power", None) and avg_power:
+        try:
+            new_msg.avg_power = avg_power
+        except Exception:
+            pass
+
+    if not getattr(new_msg, "avg_heart_rate", None) and avg_hr:
+        try:
+            new_msg.avg_heart_rate = avg_hr
+        except Exception:
+            pass
+
+    return new_msg
+
+
+def process_and_spoof_fit_file(
+    input_fit_path: Path, output_fit_path: Path, expected_profile: Optional[str] = None
+) -> bool:
+    """
+    Parses, validates profile, cleans up metrics, and applies Garmin Edge 1030 Plus device spoofing.
+
+    Returns:
+        bool: True if processed successfully, False if skipped (e.g. mismatched profile) or on error.
+    """
+    try:
+        fit_file = FitFile.from_file(str(input_fit_path))
+    except Exception as e:
+        logger.error(f"Failed to read FIT file {input_fit_path.name}: {e}")
+        return False
+
+    # Multi-User Profile Check
+    if expected_profile:
+        file_profile = extract_fit_profile_name(fit_file)
+        if file_profile:
+            if file_profile.lower() != expected_profile.lower():
+                logger.warning(
+                    f"Skipping '{input_fit_path.name}': Athlete profile '{file_profile}' "
+                    f"does not match configured target profile '{expected_profile}'."
+                )
+                return False
+            logger.info(f"Validated athlete profile match: '{file_profile}'")
         else:
-            logger.info("No existing session. Please log in.")
-            get_credentials_for_garmin()
-    except GarthException as e:
-        logger.info(f"Authentication error: {e}")
-        sys.exit(1)
+            logger.info(f"No athlete profile name embedded in {input_fit_path.name}. Proceeding with processing.")
 
-
-def calculate_avg(values: iter) -> int:
-    """
-    Calculate the average of a list of values, returning 0 if the list is empty.
-
-    Args:
-        values (List[float]): The list of values to average.
-
-    Returns:
-        float: The average value or 0 if the list is empty.
-    """
-    return sum(values) / len(values) if values else 0
-
-
-def append_value(values: List[int], message: object, field_name: str) -> None:
-    """
-    Appends a value to the 'values' list based on a field from 'message'.
-
-    Args:
-        values (List[int]): The list to append the value to.
-        message (object): The object that holds the field value.
-        field_name (str): The name of the field to retrieve from the message.
-
-    Returns:
-        None
-    """
-    value=getattr(message, field_name, None)
-    values.append(value if value else 0)
-
-
-def reset_values() -> tuple[List[int], List[int], List[int], List[int]]:
-    """
-    Resets and returns three empty lists for cadence, power 
-    and heart rate values.
-
-    Returns:
-        tuple: A tuple containing three empty lists 
-        (cadence, power, and heart rate).
-    """
-    return  [], [], [], []
-
-
-def cleanup_fit_file(fit_file_path: Path, new_file_path: Path) -> None:
-    """
-    Clean up the FIT file by processing and removing unnecessary fields.
-    Also, calculate average values for cadence, power, and heart rate.
-
-    Args:
-        fit_file_path (Path): The path to the input FIT file.
-        new_file_path (Path): The path to save the processed FIT file.
-
-    Returns:
-        None
-    """
     builder = FitFileBuilder()
-    fit_file = FitFile.from_file(str(fit_file_path))
     lap_values, cadence_values, power_values, heart_rate_values = reset_values()
+    has_device_info = False
 
     for record in fit_file.records:
         message = record.message
-        if isinstance(message, LapMessage):
+
+        # 1. Device Spoofing: File ID message
+        if isinstance(message, FileIdMessage):
+            message.manufacturer = Manufacturer.GARMIN.value
+            message.product = GarminProduct.EDGE_1030_PLUS.value
+            if hasattr(message, "garmin_product"):
+                message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+
+        # 2. Device Spoofing: Device Info message
+        elif isinstance(message, DeviceInfoMessage):
+            has_device_info = True
+            message.manufacturer = Manufacturer.GARMIN.value
+            message.product = GarminProduct.EDGE_1030_PLUS.value
+            message.product_name = "Edge 1030 Plus"
+            if hasattr(message, "garmin_product"):
+                message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+
+        # 3. Lap Message Accumulation
+        elif isinstance(message, LapMessage):
             append_value(lap_values, message, "start_time")
             append_value(lap_values, message, "total_elapsed_time")
             append_value(lap_values, message, "total_distance")
@@ -358,121 +344,175 @@ def cleanup_fit_file(fit_file_path: Path, new_file_path: Path) -> None:
             append_value(lap_values, message, "avg_cadence")
             append_value(lap_values, message, "max_cadence")
             append_value(lap_values, message, "total_calories")
-        if isinstance(message, RecordMessage):
-            message.remove_field(RecordTemperatureField.ID)
+
+        # 4. Record Message: Remove temperature & accumulate metrics
+        elif isinstance(message, RecordMessage):
+            try:
+                message.remove_field(RecordTemperatureField.ID)
+            except Exception:
+                pass
             append_value(cadence_values, message, "cadence")
             append_value(power_values, message, "power")
             append_value(heart_rate_values, message, "heart_rate")
-        if isinstance(message, SessionMessage):
-            if not message.avg_cadence:
-                message.avg_cadence = calculate_avg(cadence_values)
-            if not message.avg_power:
-                message.avg_power = calculate_avg(power_values)
-            if not message.avg_heart_rate:
-                message.avg_heart_rate = calculate_avg(heart_rate_values)
+
+        # 5. Session Message: Safely populate missing averages
+        elif isinstance(message, SessionMessage):
+            message = safe_update_session_message(
+                orig_msg=message,
+                avg_cadence=calculate_avg(cadence_values),
+                avg_power=calculate_avg(power_values),
+                avg_hr=calculate_avg(heart_rate_values),
+            )
             lap_values, cadence_values, power_values, heart_rate_values = reset_values()
+
         builder.add(message)
-    builder.build().to_file(str(new_file_path))
-    logger.info(f"Cleaned-up file saved as {SCRIPT_DIR}/{new_file_path.name}")
 
 
-def get_most_recent_fit_file(fitfile_location: Path) -> Path:
-    """
-    Returns the most recent .fit file based 
-    on versioning in the filename.
-    """
-    fit_files = fitfile_location.glob("MyNewActivity-*.fit")
-    fit_files = sorted(fit_files, key=lambda f: 
-                       tuple(map(int, re.findall(r'(\d+)',
-                                                 f.stem.split('-')[-1]))),
-                       reverse=True)
-    return fit_files[0] if fit_files else Path()
 
-
-def generate_new_filename(fit_file: Path) -> str:
-    """Generates a new filename with a timestamp."""
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    return f"{fit_file.stem}_{timestamp}.fit"
-
-
-def cleanup_and_save_fit_file(fitfile_location: Path) -> Path:
-    """
-    Clean up the most recent .fit file in a directory and save it 
-    with a timestamped filename.
-
-    Args:
-        fitfile_location (Path): The directory containing the .fit files.
-
-    Returns:
-        Path: The path to the newly saved and cleaned .fit file, 
-        or an empty Path if no .fit file is found or if the path is invalid.
-    """
-    if not fitfile_location.is_dir():
-        logger.info(f"The specified path is not a directory:"
-                    f"{fitfile_location}.")
-        return Path()
-
-    logger.debug(f"Checking for .fit files in directory: {fitfile_location}.")
-    fit_file = get_most_recent_fit_file(fitfile_location)
-
-    if not fit_file:
-        logger.info("No .fit files found.")
-        return Path()
-
-    logger.debug(f"Found the most recent .fit file: {fit_file.name}.")
-    new_filename = generate_new_filename(fit_file)
-
-    if not BACKUP_FITFILE_LOCATION.exists():
-        logger.error(f"{BACKUP_FITFILE_LOCATION} does not exist."
-                     "Did you delete it?")
-        return Path()
-
-    new_file_path = BACKUP_FITFILE_LOCATION / new_filename
-    logger.info(f"Cleaning up {new_file_path}.")
+    # If no DeviceInfoMessage was in the file, inject one for Garmin Connect
+    if not has_device_info:
+        dev_msg = DeviceInfoMessage()
+        dev_msg.manufacturer = Manufacturer.GARMIN.value
+        dev_msg.product = GarminProduct.EDGE_1030_PLUS.value
+        dev_msg.product_name = "Edge 1030 Plus"
+        dev_msg.device_index = 0
+        builder.add(dev_msg)
 
     try:
-        cleanup_fit_file(fit_file, new_file_path)  
-        logger.info(f"Successfully cleaned {fit_file.name} "
-                    f"and saved it as {new_file_path.name}.")
-        return new_file_path
+        output_fit_path.parent.mkdir(parents=True, exist_ok=True)
+        builder.build().to_file(str(output_fit_path))
+        logger.info(f"Successfully processed and spoofed '{input_fit_path.name}' -> Garmin Edge 1030 Plus.")
+        return True
     except Exception as e:
-        logger.error(f"Failed to process {fit_file.name}: {e}.")
-        return Path()
+        logger.error(f"Failed to write processed FIT file {output_fit_path.name}: {e}")
+        return False
 
 
-def upload_fit_file_to_garmin(new_file_path: Path):
+def archive_file(source_file: Path, archive_dir: Path) -> Optional[Path]:
     """
-    Upload a .fit file to Garmin using the Garth client.
+    Moves a processed file into the archive folder, handling filename collisions.
+    """
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    destination = archive_dir / source_file.name
 
-    Args:
-        new_file_path (Path): The path to the .fit file to upload.
+    if destination.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destination = archive_dir / f"{source_file.stem}_{timestamp}{source_file.suffix}"
 
-    Returns:
-        None
+    try:
+        shutil.move(str(source_file), str(destination))
+        logger.info(f"Archived '{source_file.name}' to '{destination}'.")
+        return destination
+    except Exception as e:
+        logger.error(f"Failed to archive '{source_file.name}': {e}")
+        return None
+
+
+def upload_fit_file_to_garmin(file_path: Path) -> bool:
+    """
+    Uploads a .fit file to Garmin Connect using Garth.
+    Returns True if uploaded successfully or recognized as duplicate on Garmin.
     """
     try:
-        if new_file_path and new_file_path.exists():
-            with open(new_file_path, "rb") as f:
-                uploaded = garth.client.upload(f)
-                logger.debug(uploaded)
-        else:
-            logger.info(f"Invalid file path: {new_file_path}.")
-    except GarthHTTPError:
-        logger.info("Duplicate activity found on Garmin Connect.")
+        with open(file_path, "rb") as f:
+            uploaded = garth.client.upload(f)
+            logger.info(f"Successfully uploaded {file_path.name} to Garmin Connect! (Response: {uploaded})")
+            return True
+    except GarthHTTPError as e:
+        # HTTP 409 or duplicate activity error
+        if "409" in str(e) or "duplicate" in str(e).lower():
+            logger.warning(f"Activity {file_path.name} already exists on Garmin Connect (duplicate detected).")
+            return True
+        logger.error(f"Garmin HTTP upload error for {file_path.name}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Garmin upload failed for {file_path.name}: {e}")
+        return False
+
+
+def get_pending_fit_files(workout_dir: Path, archive_dir: Path) -> List[Path]:
+    """
+    Discovers all candidate .fit files in the workout directory, ignoring the archive directory.
+    """
+    candidate_files = []
+    for f in workout_dir.glob("*.fit"):
+        # Skip files already inside archive or subdirectories
+        if f.is_file() and archive_dir not in f.parents and f.parent == workout_dir:
+            candidate_files.append(f)
+
+    # Sort oldest to newest by modification time
+    candidate_files.sort(key=lambda x: x.stat().st_mtime)
+    return candidate_files
 
 
 def main():
-    """
-    Main function to authenticate to Garmin, clean and save the FIT file, 
-    and upload it to Garmin.
+    """Main execution entry point."""
+    logger.info("=== Starting MyWhoosh2Garmin Sync ===")
 
-    Returns:
-        None
-    """
-    authenticate_to_garmin()
-    new_file_path = cleanup_and_save_fit_file(FITFILE_LOCATION)
-    if new_file_path:
-        upload_fit_file_to_garmin(new_file_path)
+    # 1. Discover Workout Path
+    workout_dir = get_fitfile_location()
+    if not workout_dir:
+        logger.error("Aborting sync: Workout directory not found.")
+        sys.exit(1)
+
+    archive_dir = get_archive_location(workout_dir)
+    pending_files = get_pending_fit_files(workout_dir, archive_dir)
+
+    if not pending_files:
+        logger.info("No pending .fit files found to process.")
+        return
+
+    logger.info(f"Found {len(pending_files)} pending workout file(s).")
+
+    # 2. Authenticate to Garmin
+    if not authenticate_to_garmin():
+        logger.error("Aborting sync: Authentication with Garmin Connect failed.")
+        sys.exit(1)
+
+    # 3. Temporary processing directory
+    temp_dir = SCRIPT_DIR / "temp_processing"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    success_count = 0
+
+    try:
+        for fit_path in pending_files:
+            logger.info(f"Processing '{fit_path.name}'...")
+            temp_output = temp_dir / f"spoofed_{fit_path.name}"
+
+            # Process, check athlete profile, and spoof as Garmin Edge 1030 Plus
+            processed = process_and_spoof_fit_file(
+                input_fit_path=fit_path,
+                output_fit_path=temp_output,
+                expected_profile=MYWHOOSH_PROFILE_NAME if MYWHOOSH_PROFILE_NAME else None,
+            )
+
+            if not processed:
+                # File was skipped due to profile mismatch or parsing failure
+                if temp_output.exists():
+                    temp_output.unlink(missing_ok=True)
+                continue
+
+            # Upload to Garmin Connect
+            upload_success = upload_fit_file_to_garmin(temp_output)
+
+            # Clean up temp file
+            if temp_output.exists():
+                temp_output.unlink(missing_ok=True)
+
+            # Archive the original workout file if successfully uploaded (or duplicate)
+            if upload_success:
+                archive_file(fit_path, archive_dir)
+                success_count += 1
+            else:
+                logger.warning(f"File '{fit_path.name}' was not archived because upload failed.")
+
+    finally:
+        # Clean up temp directory
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    logger.info(f"=== Sync Completed: {success_count} file(s) synced and archived. ===")
 
 
 if __name__ == "__main__":
