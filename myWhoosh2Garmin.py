@@ -77,11 +77,16 @@ TOKENS_PATH = SCRIPT_DIR / ".garth"
 MYWHOOSH_PREFIX_WINDOWS = "MyWhooshTechnologyService."
 
 # Environment Configuration
-GARMIN_EMAIL = os.getenv("GARMIN_EMAIL") or os.getenv("GARMIN_USERNAME")
-GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD")
-MYWHOOSH_PROFILE_NAME = (os.getenv("MYWHOOSH_PROFILE_NAME") or "").strip()
-ENV_WORKOUTS_DIR = (os.getenv("MYWHOOSH_WORKOUTS_DIR") or "").strip()
-ENV_ARCHIVE_DIR = (os.getenv("ARCHIVE_DIR") or "").strip()
+def _get_env_clean(key: str, default: str = "") -> str:
+    val = os.getenv(key, default) or ""
+    return val.strip().strip("\"'")
+
+GARMIN_EMAIL = _get_env_clean("GARMIN_EMAIL") or _get_env_clean("GARMIN_USERNAME")
+GARMIN_PASSWORD = _get_env_clean("GARMIN_PASSWORD")
+MYWHOOSH_PROFILE_NAME = _get_env_clean("MYWHOOSH_PROFILE_NAME")
+ENV_WORKOUTS_DIR = _get_env_clean("MYWHOOSH_WORKOUTS_DIR")
+ENV_ARCHIVE_DIR = _get_env_clean("ARCHIVE_DIR")
+
 
 
 def get_fitfile_location() -> Optional[Path]:
