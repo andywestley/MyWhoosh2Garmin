@@ -1,44 +1,40 @@
-# Define the JSON config file path
-$configFile = "$PSScriptRoot\mywhoosh_config.json"
-$myWhooshApp = "myWhoosh Indoor Cycling App.app"
+# ==============================================================================
+# MyWhoosh App Monitor & Sync Trigger (PowerShell)
+# Launches MyWhoosh, waits for it to close, then runs myWhoosh2Garmin.py
+# ==============================================================================
 
-# Check if the JSON file exists and read the stored path
-if (Test-Path $configFile) {
-    $config = Get-Content -Path $configFile | ConvertFrom-Json
-    $mywhooshPath = $config.path
-} else {
-    $mywhooshPath = $null
+$scriptDir = $PSScriptRoot
+$pythonScript = Join-Path $scriptDir "myWhoosh2Garmin.py"
+
+Write-Host "Waiting for MyWhoosh to start or already running..." -ForegroundColor Cyan
+
+# Check if MyWhoosh is running (Windows or Mac process names)
+function Get-MyWhooshProcess {
+    return Get-Process -Name "*mywhoosh*", "*whoosh*" -ErrorAction SilentlyContinue | Select-Object -First 1
 }
 
-# Validate the stored path
-if (-not $mywhooshPath -or -not (Test-Path $mywhooshPath)) {
-    Write-Host "Searching for $myWhooshApp"
-    $mywhooshPath = Get-ChildItem -Path "/Applications" -Filter $myWhooshApp -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-
-    if (-not $mywhooshPath) {
-        Write-Host " not found!"
-        exit 1
+$proc = Get-MyWhooshProcess
+if (-not $proc) {
+    Write-Host "MyWhoosh is not currently running. Waiting for process to start..." -ForegroundColor Yellow
+    while (-not ($proc = Get-MyWhooshProcess)) {
+        Start-Sleep -Seconds 3
     }
-
-    $mywhooshPath = $mywhooshPath.FullName
-
-    # Store the path in the JSON file
-    $config = @{ path = $mywhooshPath }
-    $config | ConvertTo-Json | Set-Content -Path $configFile
 }
 
-Write-Host "Found $myWhooshApp at $mywhooshPath"
+Write-Host "Detected active MyWhoosh process (PID: $($proc.Id)). Monitoring..." -ForegroundColor Green
 
-# Start mywhoosh.exe
-Start-Process -FilePath $mywhooshPath
-
-# Wait for the application to finish
-Write-Host "Waiting for $myWhooshApp to finish..."
-while ($process = ps -ax | grep -i $myWhooshApp | grep -v "grep") {
-    Write-Output $process
+# Wait for application to exit
+while ($null -ne (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
     Start-Sleep -Seconds 5
 }
 
-# Run the Python script
-Write-Host "$myWhooshApp has finished, running Python script..."
-python3 /Users/jayqueue/Development/Python/MyWhoosh2Garmin/myWhoosh2Garmin.py
+Write-Host "MyWhoosh has closed. Triggering synchronization script..." -ForegroundColor Cyan
+
+# Execute Python script
+if (Get-Command "python" -ErrorAction SilentlyContinue) {
+    python "$pythonScript"
+} elseif (Get-Command "py" -ErrorAction SilentlyContinue) {
+    py -3 "$pythonScript"
+} else {
+    Write-Error "Python executable not found in PATH."
+}
