@@ -254,42 +254,6 @@ def extract_fit_profile_name(fit_file: FitFile) -> Optional[str]:
     return None
 
 
-def safe_update_session_message(
-    orig_msg: SessionMessage, avg_cadence: int, avg_power: int, avg_hr: int
-) -> SessionMessage:
-    """
-    Safely copies fields from an existing SessionMessage to a new mutable SessionMessage
-    and fills in calculated average cadence, power, and heart rate if not present.
-    """
-    new_msg = SessionMessage()
-    for fld in orig_msg.fields:
-        if fld.is_valid():
-            try:
-                new_msg.get_field(fld.id).set_values(fld.get_values())
-            except Exception:
-                pass
-
-    if not getattr(new_msg, "avg_cadence", None) and avg_cadence:
-        try:
-            new_msg.avg_cadence = avg_cadence
-        except Exception:
-            pass
-
-    if not getattr(new_msg, "avg_power", None) and avg_power:
-        try:
-            new_msg.avg_power = avg_power
-        except Exception:
-            pass
-
-    if not getattr(new_msg, "avg_heart_rate", None) and avg_hr:
-        try:
-            new_msg.avg_heart_rate = avg_hr
-        except Exception:
-            pass
-
-    return new_msg
-
-
 def process_and_spoof_fit_file(
     input_fit_path: Path, output_fit_path: Path, expected_profile: Optional[str] = None
 ) -> bool:
@@ -321,7 +285,6 @@ def process_and_spoof_fit_file(
 
     builder = FitFileBuilder()
     lap_values, cadence_values, power_values, heart_rate_values = reset_values()
-    has_device_info = False
 
     for record in fit_file.records:
         message = record.message
@@ -362,7 +325,6 @@ def process_and_spoof_fit_file(
             except Exception:
                 pass
 
-
         # 3. Lap Message Accumulation
         elif isinstance(message, LapMessage):
             append_value(lap_values, message, "start_time")
@@ -386,17 +348,27 @@ def process_and_spoof_fit_file(
             append_value(power_values, message, "power")
             append_value(heart_rate_values, message, "heart_rate")
 
-        # 5. Session Message: Safely populate missing averages
+        # 5. Session Message: Populate missing averages in-place
         elif isinstance(message, SessionMessage):
-            message = safe_update_session_message(
-                orig_msg=message,
-                avg_cadence=calculate_avg(cadence_values),
-                avg_power=calculate_avg(power_values),
-                avg_hr=calculate_avg(heart_rate_values),
-            )
+            try:
+                if not getattr(message, "avg_cadence", None) and cadence_values:
+                    message.avg_cadence = calculate_avg(cadence_values)
+            except Exception:
+                pass
+            try:
+                if not getattr(message, "avg_power", None) and power_values:
+                    message.avg_power = calculate_avg(power_values)
+            except Exception:
+                pass
+            try:
+                if not getattr(message, "avg_heart_rate", None) and heart_rate_values:
+                    message.avg_heart_rate = calculate_avg(heart_rate_values)
+            except Exception:
+                pass
             lap_values, cadence_values, power_values, heart_rate_values = reset_values()
 
         builder.add(message)
+
 
     try:
         output_fit_path.parent.mkdir(parents=True, exist_ok=True)
