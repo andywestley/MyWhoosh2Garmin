@@ -9,6 +9,7 @@
 ## 🧐 Features
 
 * **Device Spoofing:** Spoofs the device in the `.fit` file to a **Garmin Edge 1030 Plus** (Garmin manufacturer ID `1`, product ID `3570`). This unlocks Garmin Connect cycling dynamics, training effect, and training status calculations.
+* **Advanced Cycling Metrics Injection:** Automatically calculates and injects **Normalized Power (NP®)**, **Intensity Factor (IF®)**, **Training Stress Score (TSS®)**, **Threshold Power (FTP)**, and **Total Work (kJ)** into session and lap summaries.
 * **Automated Path Discovery:** Automatically searches `%LOCALAPPDATA%` (e.g. `AppData\Local\MyWhoosh\Saved\Workouts` and Microsoft Store package directories) without hardcoding paths.
 * **Secure Credentials via `.env`:** Stores Garmin Connect credentials securely using `python-dotenv`. Saves session tokens in `.garth/` for fast recurring logins.
 * **Duplicate Prevention & Archiving:** Automatically moves processed and uploaded `.fit` files to an `Archive/` subfolder so they are never processed twice.
@@ -57,6 +58,9 @@ Open `.env` in Notepad or any text editor and fill in your details:
 # Garmin Connect Credentials
 GARMIN_EMAIL=your_email@example.com
 GARMIN_PASSWORD=your_secure_password
+
+# Athlete FTP (in Watts) - used for NP, IF, and TSS calculations
+ATHLETE_FTP=150
 
 # Multi-User Filter (Optional)
 # Enter your MyWhoosh athlete/display name.

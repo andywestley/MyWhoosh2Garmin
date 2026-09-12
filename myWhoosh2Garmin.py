@@ -69,6 +69,7 @@ try:
     )
     from fit_tool.profile.messages.session_message import SessionMessage
     from fit_tool.profile.messages.lap_message import LapMessage
+    from fit_tool.profile.messages.zones_target_message import ZonesTargetMessage
 except ImportError as e:
     logger.critical(f"Missing required dependency: {e}. Please run 'pip install -r requirements.txt'.")
     sys.exit(1)
@@ -86,6 +87,13 @@ GARMIN_PASSWORD = _get_env_clean("GARMIN_PASSWORD")
 MYWHOOSH_PROFILE_NAME = _get_env_clean("MYWHOOSH_PROFILE_NAME")
 ENV_WORKOUTS_DIR = _get_env_clean("MYWHOOSH_WORKOUTS_DIR")
 ENV_ARCHIVE_DIR = _get_env_clean("ARCHIVE_DIR")
+
+raw_ftp = _get_env_clean("ATHLETE_FTP")
+try:
+    ATHLETE_FTP = int(raw_ftp) if raw_ftp else 0
+except ValueError:
+    logger.warning(f"Invalid ATHLETE_FTP value '{raw_ftp}' in .env. Defaulting to 0.")
+    ATHLETE_FTP = 0
 
 
 
@@ -230,15 +238,61 @@ def calculate_avg(values: list) -> int:
     return round(sum(values) / len(values)) if values else 0
 
 
+def calculate_normalized_power(power_values: list) -> int:
+    """
+    Calculates Normalized Power (NP®) using Dr. Andrew Coggan's algorithm:
+    1. 30-second rolling moving average.
+    2. 4th-power of each 30s rolling value.
+    3. Average of 4th-power values.
+    4. 4th root of the average.
+    """
+    if not power_values:
+        return 0
+    if len(power_values) < 30:
+        return calculate_avg(power_values)
+
+    # 30-second rolling moving average
+    rolling_30s = []
+    window_sum = sum(power_values[:30])
+    rolling_30s.append(window_sum / 30.0)
+    for i in range(30, len(power_values)):
+        window_sum += power_values[i] - power_values[i - 30]
+        rolling_30s.append(window_sum / 30.0)
+
+    if not rolling_30s:
+        return 0
+
+    avg_pow4 = sum(p ** 4 for p in rolling_30s) / len(rolling_30s)
+    return round(avg_pow4 ** 0.25)
+
+
+def calculate_intensity_factor(np_val: int, ftp: int) -> float:
+    """Calculates Intensity Factor (IF = NP / FTP)."""
+    if not ftp or ftp <= 0:
+        return 0.0
+    return round(np_val / ftp, 3)
+
+
+def calculate_tss(duration_sec: int, np_val: int, if_val: float, ftp: int) -> float:
+    """Calculates Training Stress Score (TSS = (sec * NP * IF) / (FTP * 3600) * 100)."""
+    if not ftp or ftp <= 0 or not duration_sec:
+        return 0.0
+    return round((duration_sec * np_val * if_val) / (ftp * 3600.0) * 100.0, 1)
+
+
+def calculate_total_work_joules(power_values: list, duration_sec: Optional[int] = None) -> int:
+    """Calculates total work in Joules (1 kJ = 1,000 J)."""
+    if not power_values:
+        return 0
+    dur = duration_sec if duration_sec and duration_sec > 0 else len(power_values)
+    avg_p = sum(power_values) / len(power_values)
+    return round(avg_p * dur)
+
+
 def append_value(values: list, message: object, field_name: str) -> None:
     """Appends field value from message if present and truthy, else 0."""
     value = getattr(message, field_name, None)
     values.append(value if value is not None else 0)
-
-
-def reset_values() -> tuple[list, list, list, list]:
-    """Resets metric accumulators."""
-    return [], [], [], []
 
 
 def extract_fit_profile_name(fit_file: FitFile) -> Optional[str]:
@@ -254,11 +308,43 @@ def extract_fit_profile_name(fit_file: FitFile) -> Optional[str]:
     return None
 
 
+def extract_fit_ftp(fit_file: FitFile) -> Optional[int]:
+    """
+    Extracts configured FTP/threshold power from FIT records if present.
+    """
+    for record in fit_file.records:
+        msg = record.message
+        if hasattr(msg, "functional_threshold_power") and getattr(msg, "functional_threshold_power", None):
+            return int(msg.functional_threshold_power)
+        if hasattr(msg, "threshold_power") and getattr(msg, "threshold_power", None):
+            return int(msg.threshold_power)
+    return None
+
+
+def clone_message(old_msg: object, msg_class: type) -> object:
+    """
+    Clones all valid fields from an existing FIT message into a fresh message instance.
+    This allows dynamically adding/modifying fields that were not defined in the input file.
+    """
+    new_msg = msg_class()
+    if hasattr(old_msg, "fields"):
+        for old_field in old_msg.fields:
+            if old_field.is_valid():
+                new_field = new_msg.get_field(old_field.field_id)
+                if new_field:
+                    try:
+                        new_field.set_values(old_field.get_values())
+                    except Exception:
+                        pass
+    return new_msg
+
+
 def process_and_spoof_fit_file(
     input_fit_path: Path, output_fit_path: Path, expected_profile: Optional[str] = None
 ) -> bool:
     """
-    Parses, validates profile, cleans up metrics, and applies Garmin Edge 1030 Plus device spoofing.
+    Parses, validates profile, calculates advanced cycling metrics (NP, IF, TSS, Work, FTP),
+    cleans up metrics, and applies Garmin Edge 1030 Plus device spoofing.
 
     Returns:
         bool: True if processed successfully, False if skipped (e.g. mismatched profile) or on error.
@@ -283,8 +369,24 @@ def process_and_spoof_fit_file(
         else:
             logger.info(f"No athlete profile name embedded in {input_fit_path.name}. Proceeding with processing.")
 
+    # Determine FTP: Extract from FIT file if present, else fallback to ATHLETE_FTP from .env
+    file_ftp = extract_fit_ftp(fit_file)
+    effective_ftp = file_ftp if file_ftp and file_ftp > 0 else ATHLETE_FTP
+    if effective_ftp > 0:
+        logger.info(f"Using FTP: {effective_ftp}W ({'from FIT file' if file_ftp else 'from .env'})")
+    else:
+        logger.warning("No FTP configured or found in FIT file. Set ATHLETE_FTP in .env for TSS/IF calculations.")
+
     builder = FitFileBuilder()
-    lap_values, cadence_values, power_values, heart_rate_values = reset_values()
+
+    # Lap-level and Session-level metric accumulators
+    lap_cadence_values: List[int] = []
+    lap_power_values: List[int] = []
+    lap_heart_rate_values: List[int] = []
+
+    session_cadence_values: List[int] = []
+    session_power_values: List[int] = []
+    session_heart_rate_values: List[int] = []
 
     for record in fit_file.records:
         message = record.message
@@ -325,18 +427,14 @@ def process_and_spoof_fit_file(
             except Exception:
                 pass
 
-        # 3. Lap Message Accumulation
-        elif isinstance(message, LapMessage):
-            append_value(lap_values, message, "start_time")
-            append_value(lap_values, message, "total_elapsed_time")
-            append_value(lap_values, message, "total_distance")
-            append_value(lap_values, message, "avg_speed")
-            append_value(lap_values, message, "max_speed")
-            append_value(lap_values, message, "avg_heart_rate")
-            append_value(lap_values, message, "max_heart_rate")
-            append_value(lap_values, message, "avg_cadence")
-            append_value(lap_values, message, "max_cadence")
-            append_value(lap_values, message, "total_calories")
+        # 3. Zones Target Message: Update FTP if present
+        elif isinstance(message, ZonesTargetMessage):
+            message = clone_message(message, ZonesTargetMessage)
+            if effective_ftp > 0:
+                try:
+                    message.functional_threshold_power = effective_ftp
+                except Exception:
+                    pass
 
         # 4. Record Message: Remove temperature & accumulate metrics
         elif isinstance(message, RecordMessage):
@@ -344,31 +442,154 @@ def process_and_spoof_fit_file(
                 message.remove_field(RecordTemperatureField.ID)
             except Exception:
                 pass
-            append_value(cadence_values, message, "cadence")
-            append_value(power_values, message, "power")
-            append_value(heart_rate_values, message, "heart_rate")
 
-        # 5. Session Message: Populate missing averages in-place
+            p_val = getattr(message, "power", None)
+            c_val = getattr(message, "cadence", None)
+            hr_val = getattr(message, "heart_rate", None)
+
+            if p_val is not None:
+                lap_power_values.append(p_val)
+                session_power_values.append(p_val)
+            if c_val is not None:
+                lap_cadence_values.append(c_val)
+                session_cadence_values.append(c_val)
+            if hr_val is not None:
+                lap_heart_rate_values.append(hr_val)
+                session_heart_rate_values.append(hr_val)
+
+        # 5. Lap Message: Populate missing averages & power metrics
+        elif isinstance(message, LapMessage):
+            message = clone_message(message, LapMessage)
+            if lap_power_values:
+                try:
+                    if not getattr(message, "avg_power", None):
+                        message.avg_power = calculate_avg(lap_power_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "max_power", None):
+                        message.max_power = max(lap_power_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "normalized_power", None):
+                        message.normalized_power = calculate_normalized_power(lap_power_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "total_work", None):
+                        lap_dur = getattr(message, "total_timer_time", None) or getattr(message, "total_elapsed_time", None) or len(lap_power_values)
+                        message.total_work = calculate_total_work_joules(lap_power_values, lap_dur)
+                except Exception:
+                    pass
+            if lap_cadence_values:
+                try:
+                    if not getattr(message, "avg_cadence", None):
+                        message.avg_cadence = calculate_avg(lap_cadence_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "max_cadence", None):
+                        message.max_cadence = max(lap_cadence_values)
+                except Exception:
+                    pass
+            if lap_heart_rate_values:
+                try:
+                    if not getattr(message, "avg_heart_rate", None):
+                        message.avg_heart_rate = calculate_avg(lap_heart_rate_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "max_heart_rate", None):
+                        message.max_heart_rate = max(lap_heart_rate_values)
+                except Exception:
+                    pass
+
+            # Reset lap accumulators for the next lap
+            lap_cadence_values = []
+            lap_power_values = []
+            lap_heart_rate_values = []
+
+        # 6. Session Message: Populate missing averages, NP, IF, TSS, Work, and FTP
         elif isinstance(message, SessionMessage):
-            try:
-                if not getattr(message, "avg_cadence", None) and cadence_values:
-                    message.avg_cadence = calculate_avg(cadence_values)
-            except Exception:
-                pass
-            try:
-                if not getattr(message, "avg_power", None) and power_values:
-                    message.avg_power = calculate_avg(power_values)
-            except Exception:
-                pass
-            try:
-                if not getattr(message, "avg_heart_rate", None) and heart_rate_values:
-                    message.avg_heart_rate = calculate_avg(heart_rate_values)
-            except Exception:
-                pass
-            lap_values, cadence_values, power_values, heart_rate_values = reset_values()
+            message = clone_message(message, SessionMessage)
+            if session_power_values:
+                try:
+                    if not getattr(message, "avg_power", None):
+                        message.avg_power = calculate_avg(session_power_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "max_power", None):
+                        message.max_power = max(session_power_values)
+                except Exception:
+                    pass
+                
+                # Normalized Power (NP)
+                np_val = calculate_normalized_power(session_power_values)
+                try:
+                    message.normalized_power = np_val
+                except Exception:
+                    pass
+
+                # Total Work (Joules)
+                session_dur = getattr(message, "total_timer_time", None) or getattr(message, "total_elapsed_time", None) or len(session_power_values)
+                try:
+                    message.total_work = calculate_total_work_joules(session_power_values, session_dur)
+                except Exception:
+                    pass
+
+                # Advanced Metrics: IF, TSS, Threshold Power (FTP)
+                if effective_ftp > 0:
+                    try:
+                        message.threshold_power = effective_ftp
+                    except Exception:
+                        pass
+                    
+                    if_val = calculate_intensity_factor(np_val or calculate_avg(session_power_values), effective_ftp)
+                    try:
+                        message.intensity_factor = if_val
+                    except Exception:
+                        pass
+
+                    tss_val = calculate_tss(session_dur, np_val or calculate_avg(session_power_values), if_val, effective_ftp)
+                    try:
+                        message.training_stress_score = tss_val
+                    except Exception:
+                        pass
+
+                    total_work_val = getattr(message, "total_work", None) or 0
+                    logger.info(
+                        f"Computed Session Metrics: Avg Power={getattr(message, 'avg_power', 'N/A')}W, "
+                        f"Max Power={getattr(message, 'max_power', 'N/A')}W, NP={np_val}W, IF={if_val}, "
+                        f"TSS={tss_val}, Work={round(total_work_val / 1000)}kJ, FTP={effective_ftp}W"
+                    )
+
+            if session_cadence_values:
+                try:
+                    if not getattr(message, "avg_cadence", None):
+                        message.avg_cadence = calculate_avg(session_cadence_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "max_cadence", None):
+                        message.max_cadence = max(session_cadence_values)
+                except Exception:
+                    pass
+
+            if session_heart_rate_values:
+                try:
+                    if not getattr(message, "avg_heart_rate", None):
+                        message.avg_heart_rate = calculate_avg(session_heart_rate_values)
+                except Exception:
+                    pass
+                try:
+                    if not getattr(message, "max_heart_rate", None):
+                        message.max_heart_rate = max(session_heart_rate_values)
+                except Exception:
+                    pass
 
         builder.add(message)
-
 
     try:
         output_fit_path.parent.mkdir(parents=True, exist_ok=True)
