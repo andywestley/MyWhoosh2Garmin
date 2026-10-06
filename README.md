@@ -104,7 +104,21 @@ GIT_AUTO_PUSH=true
 | `GIT_AUTO_PUSH` | `true` | Automatically run `git push` after committing activity backups. |
 
 
-### 6. Run an Initial Test
+### 6. Test with a Dummy Activity (Optional)
+
+You can generate a 60-second test activity `.fit` file titled `TEST DUMMY RIDE (DELETE ME)` with realistic power, heart rate, and cadence to test the entire upload, spoofing, and metadata pipeline:
+
+```cmd
+# Generate a test dummy .fit file in your MyWhoosh workouts folder
+python generate_test_fit.py --deposit
+
+# Run the sync script to process and upload it
+python myWhoosh2Garmin.py
+```
+
+After verifying the upload in Garmin Connect, you can delete the activity in Garmin Connect with one click.
+
+### 7. Run an Initial Test
 
 Run the Python script once manually from the command prompt to verify credentials, upload, and backup:
 
