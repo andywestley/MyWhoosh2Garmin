@@ -1255,15 +1255,17 @@ def git_backup_repository(
 
     # 1. git pull (to sync any remote deletions or edits from GitHub)
     try:
-        subprocess.run(
-            ["git", "pull", "--rebase"],
+        pull_res = subprocess.run(
+            ["git", "pull", "--rebase", "--autostash"],
             cwd=str(repo_path),
             capture_output=True,
             text=True,
             check=False,
         )
+        if pull_res.returncode != 0:
+            logger.debug(f"git pull notice in {repo_path}: {pull_res.stderr.strip()}")
     except Exception as e:
-        logger.debug(f"git pull skipped or failed in {repo_path}: {e}")
+        logger.debug(f"git pull error in {repo_path}: {e}")
 
     # 2. git add .
     try:
