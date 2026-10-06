@@ -145,6 +145,10 @@ def create_dummy_fit(output_path: Path, workout_name: str = "TEST DUMMY RIDE (DE
 
 
 def main():
+    now_dt = datetime.now()
+    default_name = f"TEST DUMMY RIDE ({now_dt.strftime('%Y-%m-%d %H:%M:%S')}) - DELETE ME"
+    default_filename = f"dummy_test_ride_{now_dt.strftime('%Y%m%d_%H%M%S')}.fit"
+
     parser = argparse.ArgumentParser(description="Generate a dummy .fit file for Garmin upload testing.")
     parser.add_argument(
         "--deposit",
@@ -154,7 +158,7 @@ def main():
     parser.add_argument(
         "--name",
         type=str,
-        default="TEST DUMMY RIDE (DELETE ME)",
+        default=default_name,
         help="Workout title to embed in the test FIT file.",
     )
     parser.add_argument(
@@ -166,7 +170,7 @@ def main():
 
     args = parser.parse_args()
 
-    filename = f"dummy_test_ride_{datetime.now().strftime('%Y%m%d_%H%M%S')}.fit"
+    filename = default_filename
 
     if args.out:
         target_path = Path(args.out).resolve()
