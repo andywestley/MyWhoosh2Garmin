@@ -19,6 +19,7 @@ Description:
 
 import os
 import sys
+import time
 import shutil
 import logging
 from pathlib import Path
@@ -968,45 +969,66 @@ def extract_activity_id_from_upload_response(upload_res: Any) -> Optional[int]:
     return None
 
 
-def get_latest_garmin_activity_id(expected_dt: Optional[datetime] = None) -> Optional[int]:
-    """
-    Fetches the most recent activity ID from Garmin Connect API as a fallback,
-    strictly validating that its start time matches the uploaded workout.
-    """
+def _timestamps_match(act_str: Optional[str], expected_dt: datetime) -> bool:
+    """Helper to check if a Garmin activity timestamp matches expected workout datetime."""
+    if not act_str:
+        return False
+    clean_ts = act_str.replace("T", " ").split(".")[0]
     try:
-        activities = garth.client.connectapi(
-            "/activitylist-service/activities/search/activities",
-            params={"limit": 1},
-        )
-        if isinstance(activities, list) and len(activities) > 0:
-            act = activities[0]
-            if isinstance(act, dict) and "activityId" in act:
-                act_id = int(act["activityId"])
-                
-                # Verify start time matches to prevent ever touching unrelated activities
-                if expected_dt:
-                    start_str = act.get("startTimeLocal") or act.get("startTimeGMT")
-                    if start_str:
-                        try:
-                            # Normalize format: "YYYY-MM-DD HH:MM:SS" or ISO
-                            clean_ts = start_str.replace("T", " ").split(".")[0]
-                            act_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
-                            diff_sec = abs((act_dt - expected_dt).total_seconds())
-                            # Allow reasonable timezone/clock skew tolerance (up to 15 mins)
-                            if diff_sec > 900:
-                                logger.warning(
-                                    f"Garmin activity ID {act_id} start time ({start_str}) does not match "
-                                    f"uploaded workout ({expected_dt.strftime('%Y-%m-%d %H:%M:%S')}). "
-                                    "Skipping metadata update to prevent renaming unrelated activities."
-                                )
-                                return None
-                        except Exception as e:
-                            logger.debug(f"Could not parse Garmin activity timestamp '{start_str}': {e}")
+        act_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return False
 
-                logger.info(f"Retrieved verified Garmin activity ID via Connect API: {act_id}")
-                return act_id
-    except Exception as e:
-        logger.warning(f"Could not retrieve latest activity from Garmin Connect API: {e}")
+    diff = abs((act_dt - expected_dt).total_seconds())
+    # Match within 25 mins directly
+    if diff <= 1500:
+        return True
+    # Account for UTC vs local timezone offsets (e.g. 1h, 2h, etc.)
+    rem = diff % 3600
+    if (rem <= 1500 or rem >= 2100) and diff <= 50400:
+        return True
+    return False
+
+
+def get_latest_garmin_activity_id(expected_dt: Optional[datetime] = None, max_retries: int = 4) -> Optional[int]:
+    """
+    Fetches the matching activity ID from Garmin Connect API as a fallback,
+    searching the recent activities and retrying to allow Garmin ingestion to complete.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            activities = garth.client.connectapi(
+                "/activitylist-service/activities/search/activities",
+                params={"limit": 5},
+            )
+            if isinstance(activities, list) and len(activities) > 0:
+                for act in activities:
+                    if isinstance(act, dict) and "activityId" in act:
+                        act_id = int(act["activityId"])
+                        
+                        # Verify start time matches if provided
+                        if expected_dt:
+                            start_local = act.get("startTimeLocal")
+                            start_gmt = act.get("startTimeGMT")
+                            
+                            if _timestamps_match(start_local, expected_dt) or _timestamps_match(start_gmt, expected_dt):
+                                logger.info(f"Retrieved verified Garmin activity ID via Connect API: {act_id}")
+                                return act_id
+                        else:
+                            return act_id
+
+        except Exception as e:
+            logger.warning(f"Could not retrieve activities from Garmin Connect API (attempt {attempt}/{max_retries}): {e}")
+
+        if attempt < max_retries:
+            logger.info(f"Waiting for Garmin to complete activity ingestion (attempt {attempt}/{max_retries})...")
+            time.sleep(2 * attempt)
+
+    if expected_dt:
+        logger.warning(
+            f"Could not find a recent Garmin activity matching workout time ({expected_dt.strftime('%Y-%m-%d %H:%M:%S')}). "
+            "Skipping metadata update to prevent renaming unrelated activities."
+        )
     return None
 
 
@@ -1406,15 +1428,20 @@ def main():
                     )
 
                 # Automated GitHub Ride Backup & Telemetry Indexing
-                if ENABLE_GIT_BACKUP and GIT_BACKUP_REPO_PATH:
-                    backup_file_target = temp_output if temp_output.exists() else fit_path
-                    backup_and_index_ride(
-                        source_fit_path=backup_file_target,
-                        telemetry=telemetry,
-                        repo_path_str=GIT_BACKUP_REPO_PATH,
-                        subdir_str=GIT_BACKUP_SUBDIR,
-                        auto_push=GIT_AUTO_PUSH,
-                    )
+                if ENABLE_GIT_BACKUP:
+                    if GIT_BACKUP_REPO_PATH:
+                        backup_file_target = temp_output if temp_output.exists() else fit_path
+                        backup_and_index_ride(
+                            source_fit_path=backup_file_target,
+                            telemetry=telemetry,
+                            repo_path_str=GIT_BACKUP_REPO_PATH,
+                            subdir_str=GIT_BACKUP_SUBDIR,
+                            auto_push=GIT_AUTO_PUSH,
+                        )
+                    else:
+                        logger.warning("GitHub backup is enabled (ENABLE_GIT_BACKUP=true), but GIT_BACKUP_REPO_PATH is empty in .env. Skipping Git backup.")
+                else:
+                    logger.info("GitHub ride backup is disabled (ENABLE_GIT_BACKUP=false).")
 
                 # Clean up temp file
                 if temp_output.exists():
