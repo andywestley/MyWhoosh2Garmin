@@ -969,66 +969,40 @@ def extract_activity_id_from_upload_response(upload_res: Any) -> Optional[int]:
     return None
 
 
-def _timestamps_match(act_str: Optional[str], expected_dt: datetime) -> bool:
-    """Helper to check if a Garmin activity timestamp matches expected workout datetime."""
-    if not act_str:
-        return False
-    clean_ts = act_str.replace("T", " ").split(".")[0]
-    try:
-        act_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return False
-
-    diff = abs((act_dt - expected_dt).total_seconds())
-    # Match within 25 mins directly
-    if diff <= 1500:
-        return True
-    # Account for UTC vs local timezone offsets (e.g. 1h, 2h, etc.)
-    rem = diff % 3600
-    if (rem <= 1500 or rem >= 2100) and diff <= 50400:
-        return True
-    return False
+def extract_upload_id(upload_res: Any) -> Optional[int]:
+    """Extracts uploadId from upload response."""
+    if not upload_res or not isinstance(upload_res, dict):
+        return None
+    detail = upload_res.get("detailedImportResult")
+    if isinstance(detail, dict) and detail.get("uploadId"):
+        try:
+            return int(detail["uploadId"])
+        except (ValueError, TypeError):
+            pass
+    if "uploadId" in upload_res and upload_res["uploadId"]:
+        try:
+            return int(upload_res["uploadId"])
+        except (ValueError, TypeError):
+            pass
+    return None
 
 
-def get_latest_garmin_activity_id(expected_dt: Optional[datetime] = None, max_retries: int = 4) -> Optional[int]:
+def poll_garmin_upload_status(upload_id: int, max_retries: int = 5) -> Optional[int]:
     """
-    Fetches the matching activity ID from Garmin Connect API as a fallback,
-    searching the recent activities and retrying to allow Garmin ingestion to complete.
+    Polls Garmin's upload status endpoint for the exact uploadId until the activityId is returned.
+    This guarantees 100% precision by querying the upload transaction directly.
     """
     for attempt in range(1, max_retries + 1):
+        time.sleep(2)
         try:
-            activities = garth.client.connectapi(
-                "/activitylist-service/activities/search/activities",
-                params={"limit": 5},
-            )
-            if isinstance(activities, list) and len(activities) > 0:
-                for act in activities:
-                    if isinstance(act, dict) and "activityId" in act:
-                        act_id = int(act["activityId"])
-                        
-                        # Verify start time matches if provided
-                        if expected_dt:
-                            start_local = act.get("startTimeLocal")
-                            start_gmt = act.get("startTimeGMT")
-                            
-                            if _timestamps_match(start_local, expected_dt) or _timestamps_match(start_gmt, expected_dt):
-                                logger.info(f"Retrieved verified Garmin activity ID via Connect API: {act_id}")
-                                return act_id
-                        else:
-                            return act_id
-
+            status_res = garth.client.connectapi(f"/upload-service/upload/status/{upload_id}")
+            act_id = extract_activity_id_from_upload_response(status_res)
+            if act_id:
+                logger.info(f"Retrieved activity ID {act_id} from upload {upload_id} status poll.")
+                return act_id
         except Exception as e:
-            logger.warning(f"Could not retrieve activities from Garmin Connect API (attempt {attempt}/{max_retries}): {e}")
-
-        if attempt < max_retries:
-            logger.info(f"Waiting for Garmin to complete activity ingestion (attempt {attempt}/{max_retries})...")
-            time.sleep(2 * attempt)
-
-    if expected_dt:
-        logger.warning(
-            f"Could not find a recent Garmin activity matching workout time ({expected_dt.strftime('%Y-%m-%d %H:%M:%S')}). "
-            "Skipping metadata update to prevent renaming unrelated activities."
-        )
+            logger.debug(f"Error checking upload status for {upload_id}: {e}")
+    logger.warning(f"Could not retrieve activity ID from upload {upload_id} status polling.")
     return None
 
 
@@ -1069,7 +1043,7 @@ def update_garmin_activity_metadata(
         return False
 
 
-def upload_fit_file_to_garmin(file_path: Path, expected_dt: Optional[datetime] = None) -> Tuple[bool, Optional[int]]:
+def upload_fit_file_to_garmin(file_path: Path) -> Tuple[bool, Optional[int]]:
     """
     Uploads a .fit file to Garmin Connect using Garth.
     Returns (success: bool, activity_id: Optional[int]).
@@ -1078,16 +1052,22 @@ def upload_fit_file_to_garmin(file_path: Path, expected_dt: Optional[datetime] =
         with open(file_path, "rb") as f:
             uploaded = garth.client.upload(f)
             logger.info(f"Successfully uploaded {file_path.name} to Garmin Connect! (Response: {uploaded})")
+            
+            # 1. Check if activity ID was returned synchronously in the upload response
             act_id = extract_activity_id_from_upload_response(uploaded)
+            
+            # 2. If processing is asynchronous, poll the exact upload status using the unique uploadId
             if not act_id:
-                act_id = get_latest_garmin_activity_id(expected_dt=expected_dt)
+                up_id = extract_upload_id(uploaded)
+                if up_id:
+                    act_id = poll_garmin_upload_status(up_id)
+            
             return True, act_id
     except GarthHTTPError as e:
         # HTTP 409 or duplicate activity error
         if "409" in str(e) or "duplicate" in str(e).lower():
             logger.warning(f"Activity {file_path.name} already exists on Garmin Connect (duplicate detected).")
-            act_id = get_latest_garmin_activity_id(expected_dt=expected_dt)
-            return True, act_id
+            return True, None
         err_detail = ""
         if hasattr(e, "error") and hasattr(e.error, "response") and e.error.response is not None:
             err_detail = f" | Response: {e.error.response.status_code} - {e.error.response.text}"
@@ -1418,8 +1398,7 @@ def main():
                 continue
 
             # Upload to Garmin Connect
-            ride_dt_obj = datetime.strptime(telemetry.date_str, "%Y-%m-%d %H:%M:%S")
-            upload_success, activity_id = upload_fit_file_to_garmin(temp_output, expected_dt=ride_dt_obj)
+            upload_success, activity_id = upload_fit_file_to_garmin(temp_output)
 
             if upload_success:
                 if activity_id:
