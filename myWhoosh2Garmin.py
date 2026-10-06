@@ -1046,11 +1046,11 @@ def upload_fit_file_to_garmin(file_path: Path) -> Tuple[bool, Optional[int]]:
             return True, act_id
         err_detail = ""
         if hasattr(e, "error") and hasattr(e.error, "response") and e.error.response is not None:
-            err_detail = f" | Details: {e.error.response.text}"
+            err_detail = f" | Response: {e.error.response.status_code} - {e.error.response.text}"
         logger.error(f"Garmin HTTP upload error for {file_path.name}: {e}{err_detail}")
         return False, None
     except Exception as e:
-        logger.error(f"Garmin upload failed for {file_path.name}: {e}")
+        logger.error(f"Garmin upload failed for {file_path.name}: [{type(e).__name__}] {e}")
         return False, None
 
 
