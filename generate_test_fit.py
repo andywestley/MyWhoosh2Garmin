@@ -17,6 +17,7 @@ try:
     from fit_tool.fit_file_builder import FitFileBuilder
     from fit_tool.profile.messages.file_id_message import FileIdMessage
     from fit_tool.profile.messages.device_info_message import DeviceInfoMessage
+    from fit_tool.profile.messages.user_profile_message import UserProfileMessage
     from fit_tool.profile.messages.workout_message import WorkoutMessage
     from fit_tool.profile.messages.event_message import EventMessage
     from fit_tool.profile.messages.record_message import RecordMessage
@@ -37,7 +38,7 @@ except ImportError:
     print("Error: fit-tool library not found. Run 'pip install fit-tool'")
     sys.exit(1)
 
-from myWhoosh2Garmin import get_fitfile_location
+from myWhoosh2Garmin import get_fitfile_location, MYWHOOSH_PROFILE_NAME
 
 
 def create_dummy_fit(output_path: Path, workout_name: str = "TEST DUMMY RIDE (DELETE ME)", duration_seconds: int = 60) -> Path:
@@ -54,6 +55,12 @@ def create_dummy_fit(output_path: Path, workout_name: str = "TEST DUMMY RIDE (DE
     file_id.time_created = now_ms
     file_id.serial_number = 999999
     builder.add(file_id)
+
+    # 2. User Profile Message (Matches MYWHOOSH_PROFILE_NAME filter)
+    if MYWHOOSH_PROFILE_NAME:
+        user_prof = UserProfileMessage()
+        user_prof.friendly_name = MYWHOOSH_PROFILE_NAME
+        builder.add(user_prof)
 
     # 2. Device Info Message
     dev_info = DeviceInfoMessage()
