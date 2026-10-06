@@ -28,7 +28,7 @@ import re
 import csv
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from getpass import getpass
 from typing import List, Optional, Tuple, Any, Dict
 from dataclasses import dataclass, asdict
@@ -1043,7 +1043,68 @@ def update_garmin_activity_metadata(
         return False
 
 
-def upload_fit_file_to_garmin(file_path: Path) -> Tuple[bool, Optional[int]]:
+def is_exact_timestamp_match(act_str: Optional[str], expected_dt: datetime) -> bool:
+    """
+    Strictly validates that the candidate activity start time matches the FIT workout start time
+    within a maximum 120-second window in either local time or UTC.
+    """
+    if not act_str:
+        return False
+    clean_ts = act_str.replace("T", " ").split(".")[0]
+    try:
+        act_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return False
+
+    # 1. Compare directly against local datetime (within 120 seconds)
+    if abs((act_dt - expected_dt).total_seconds()) <= 120:
+        return True
+
+    # 2. Compare against UTC datetime (within 120 seconds)
+    try:
+        local_tz = datetime.now().astimezone().tzinfo
+        expected_aware = expected_dt.replace(tzinfo=local_tz)
+        expected_utc = expected_aware.astimezone(timezone.utc).replace(tzinfo=None)
+        if abs((act_dt - expected_utc).total_seconds()) <= 120:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def find_activity_id_by_exact_timestamp(expected_dt: datetime, max_retries: int = 4) -> Optional[int]:
+    """
+    Searches recent activities, matching ONLY if the start time is within 120 seconds of the workout.
+    Retries with backoff to give Garmin cloud ingestion time to complete.
+    """
+    for attempt in range(1, max_retries + 1):
+        time.sleep(2 * attempt)
+        try:
+            activities = garth.client.connectapi(
+                "/activitylist-service/activities/search/activities",
+                params={"limit": 5},
+            )
+            if isinstance(activities, list) and len(activities) > 0:
+                for act in activities:
+                    if isinstance(act, dict) and "activityId" in act:
+                        act_id = int(act["activityId"])
+                        start_local = act.get("startTimeLocal")
+                        start_gmt = act.get("startTimeGMT")
+                        if is_exact_timestamp_match(start_local, expected_dt) or is_exact_timestamp_match(start_gmt, expected_dt):
+                            logger.info(f"Retrieved verified Garmin activity ID via exact 120s timestamp match: {act_id}")
+                            return act_id
+        except Exception as e:
+            logger.debug(f"Error querying activities search (attempt {attempt}): {e}")
+
+    logger.warning(
+        f"Could not find Garmin activity strictly matching workout start time ({expected_dt.strftime('%Y-%m-%d %H:%M:%S')}) "
+        "within 120 seconds. Skipping metadata update to prevent touching unrelated activities."
+    )
+    return None
+
+
+def upload_fit_file_to_garmin(file_path: Path, expected_dt: Optional[datetime] = None) -> Tuple[bool, Optional[int]]:
     """
     Uploads a .fit file to Garmin Connect using Garth.
     Returns (success: bool, activity_id: Optional[int]).
@@ -1056,11 +1117,15 @@ def upload_fit_file_to_garmin(file_path: Path) -> Tuple[bool, Optional[int]]:
             # 1. Check if activity ID was returned synchronously in the upload response
             act_id = extract_activity_id_from_upload_response(uploaded)
             
-            # 2. If processing is asynchronous, poll the exact upload status using the unique uploadId
+            # 2. Try polling the upload status directly using uploadId
             if not act_id:
                 up_id = extract_upload_id(uploaded)
                 if up_id:
                     act_id = poll_garmin_upload_status(up_id)
+
+            # 3. Fallback: Search recent activities with a strict 120-second timestamp match
+            if not act_id and expected_dt:
+                act_id = find_activity_id_by_exact_timestamp(expected_dt)
             
             return True, act_id
     except GarthHTTPError as e:
@@ -1398,7 +1463,8 @@ def main():
                 continue
 
             # Upload to Garmin Connect
-            upload_success, activity_id = upload_fit_file_to_garmin(temp_output)
+            ride_dt_obj = datetime.strptime(telemetry.date_str, "%Y-%m-%d %H:%M:%S")
+            upload_success, activity_id = upload_fit_file_to_garmin(temp_output, expected_dt=ride_dt_obj)
 
             if upload_success:
                 if activity_id:
