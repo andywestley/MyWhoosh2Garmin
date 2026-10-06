@@ -968,9 +968,10 @@ def extract_activity_id_from_upload_response(upload_res: Any) -> Optional[int]:
     return None
 
 
-def get_latest_garmin_activity_id() -> Optional[int]:
+def get_latest_garmin_activity_id(expected_dt: Optional[datetime] = None) -> Optional[int]:
     """
-    Fetches the most recent activity ID from Garmin Connect API as a fallback.
+    Fetches the most recent activity ID from Garmin Connect API as a fallback,
+    strictly validating that its start time matches the uploaded workout.
     """
     try:
         activities = garth.client.connectapi(
@@ -981,7 +982,28 @@ def get_latest_garmin_activity_id() -> Optional[int]:
             act = activities[0]
             if isinstance(act, dict) and "activityId" in act:
                 act_id = int(act["activityId"])
-                logger.info(f"Retrieved latest Garmin activity ID via Connect API: {act_id}")
+                
+                # Verify start time matches to prevent ever touching unrelated activities
+                if expected_dt:
+                    start_str = act.get("startTimeLocal") or act.get("startTimeGMT")
+                    if start_str:
+                        try:
+                            # Normalize format: "YYYY-MM-DD HH:MM:SS" or ISO
+                            clean_ts = start_str.replace("T", " ").split(".")[0]
+                            act_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
+                            diff_sec = abs((act_dt - expected_dt).total_seconds())
+                            # Allow reasonable timezone/clock skew tolerance (up to 15 mins)
+                            if diff_sec > 900:
+                                logger.warning(
+                                    f"Garmin activity ID {act_id} start time ({start_str}) does not match "
+                                    f"uploaded workout ({expected_dt.strftime('%Y-%m-%d %H:%M:%S')}). "
+                                    "Skipping metadata update to prevent renaming unrelated activities."
+                                )
+                                return None
+                        except Exception as e:
+                            logger.debug(f"Could not parse Garmin activity timestamp '{start_str}': {e}")
+
+                logger.info(f"Retrieved verified Garmin activity ID via Connect API: {act_id}")
                 return act_id
     except Exception as e:
         logger.warning(f"Could not retrieve latest activity from Garmin Connect API: {e}")
@@ -1025,7 +1047,7 @@ def update_garmin_activity_metadata(
         return False
 
 
-def upload_fit_file_to_garmin(file_path: Path) -> Tuple[bool, Optional[int]]:
+def upload_fit_file_to_garmin(file_path: Path, expected_dt: Optional[datetime] = None) -> Tuple[bool, Optional[int]]:
     """
     Uploads a .fit file to Garmin Connect using Garth.
     Returns (success: bool, activity_id: Optional[int]).
@@ -1036,13 +1058,13 @@ def upload_fit_file_to_garmin(file_path: Path) -> Tuple[bool, Optional[int]]:
             logger.info(f"Successfully uploaded {file_path.name} to Garmin Connect! (Response: {uploaded})")
             act_id = extract_activity_id_from_upload_response(uploaded)
             if not act_id:
-                act_id = get_latest_garmin_activity_id()
+                act_id = get_latest_garmin_activity_id(expected_dt=expected_dt)
             return True, act_id
     except GarthHTTPError as e:
         # HTTP 409 or duplicate activity error
         if "409" in str(e) or "duplicate" in str(e).lower():
             logger.warning(f"Activity {file_path.name} already exists on Garmin Connect (duplicate detected).")
-            act_id = get_latest_garmin_activity_id()
+            act_id = get_latest_garmin_activity_id(expected_dt=expected_dt)
             return True, act_id
         err_detail = ""
         if hasattr(e, "error") and hasattr(e.error, "response") and e.error.response is not None:
@@ -1363,7 +1385,8 @@ def main():
                 continue
 
             # Upload to Garmin Connect
-            upload_success, activity_id = upload_fit_file_to_garmin(temp_output)
+            ride_dt_obj = datetime.strptime(telemetry.date_str, "%Y-%m-%d %H:%M:%S")
+            upload_success, activity_id = upload_fit_file_to_garmin(temp_output, expected_dt=ride_dt_obj)
 
             if upload_success:
                 if activity_id:
