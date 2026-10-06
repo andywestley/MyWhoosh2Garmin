@@ -1,15 +1,20 @@
 <h1 align="center" id="title">MyWhoosh2Garmin</h1>
 
 <p align="center">
-  <b>Automated, silent sync between MyWhoosh and Garmin Connect with Garmin Edge 1030 Plus spoofing and multi-user support.</b>
+  <b>Automated, silent sync between MyWhoosh and Garmin Connect with Garmin Edge 1030 Plus spoofing, workout metadata enrichment, and automated GitHub ride backup.</b>
 </p>
 
 ---
 
 ## 🧐 Features
 
-* **Device Spoofing:** Spoofs the device in the `.fit` file to a **Garmin Edge 1030 Plus** (Garmin manufacturer ID `1`, product ID `3570`). This unlocks Garmin Connect cycling dynamics, training effect, and training status calculations.
-* **Advanced Cycling Metrics Injection:** Automatically calculates and injects **Normalized Power (NP®)**, **Intensity Factor (IF®)**, **Training Stress Score (TSS®)**, **Threshold Power (FTP)**, and **Total Work (kJ)** into session and lap summaries.
+* **Multi-Sport & Dynamic Device Spoofing:** Automatically detects activity sport type from FIT records (`Sport.CYCLING` vs `Sport.ROWING` / `INDOOR_ROWING`):
+  * **Cycling:** Spoofs as a **Garmin Edge 1030 Plus** (unlocks Garmin cycling dynamics, training effect, and status).
+  * **Rowing:** Spoofs as a **Garmin Fēnix 7** (preserves stroke rates, 500m split metrics, and rowing training loads).
+* **Advanced Metrics Injection:** Automatically calculates and injects **Normalized Power (NP®)**, **Intensity Factor (IF®)**, **Training Stress Score (TSS®)**, **Threshold Power (FTP)**, and **Total Work (kJ)** into session and lap summaries.
+* **Workout Title Discovery & MyWhooshInfo Linkage:** Automatically extracts embedded workout names from FIT records and builds normalized links to [MyWhooshInfo](https://mywhooshinfo.com) workout profiles (e.g., `https://mywhooshinfo.com/workouts/workout/spiked-aerobic-1`).
+* **Garmin Connect Activity Metadata Enrichment:** Updates the uploaded Garmin activity title with the workout name and enriches the description notes with Coggan metrics (`NP`, `IF`, `TSS`, `Work`) and direct MyWhooshInfo reference links.
+* **Automated Multi-Sport GitHub Backup & Indexing:** Backs up `.fit` files to a configurable local Git repository partitioned by sport and date (`{repo}/cycling/YYYY/MM/` or `{repo}/rowing/YYYY/MM/`), maintains an append-only `rides_summary.csv` and `rides_index.json` catalog with sport classifications, and executes automated `git add`, `git commit`, and `git push`.
 * **Automated Path Discovery:** Automatically searches `%LOCALAPPDATA%` (e.g. `AppData\Local\MyWhoosh\Saved\Workouts` and Microsoft Store package directories) without hardcoding paths.
 * **Secure Credentials via `.env`:** Stores Garmin Connect credentials securely using `python-dotenv`. Saves session tokens in `.garth/` for fast recurring logins.
 * **Duplicate Prevention & Archiving:** Automatically moves processed and uploaded `.fit` files to an `Archive/` subfolder so they are never processed twice.
@@ -52,7 +57,7 @@ Copy `.env.example` to `.env`:
 copy .env.example .env
 ```
 
-Open `.env` in Notepad or any text editor and fill in your details:
+Open `.env` in Notepad or any text editor and configure your parameters:
 
 ```env
 # Garmin Connect Credentials
@@ -63,18 +68,45 @@ GARMIN_PASSWORD=your_secure_password
 ATHLETE_FTP=150
 
 # Multi-User Filter (Optional)
-# Enter your MyWhoosh athlete/display name.
-# If set, activities belonging to other profiles will be skipped.
+# Enter your MyWhoosh athlete/display name to filter workouts.
 MYWHOOSH_PROFILE_NAME=YourAthleteName
 
 # Path Overrides (Optional - leave blank for auto-detection)
 MYWHOOSH_WORKOUTS_DIR=
 ARCHIVE_DIR=
+
+# --- Garmin Activity Metadata Enrichment ---
+UPDATE_GARMIN_METADATA=true
+APPEND_MYWHOOSHINFO_URL=true
+
+# --- GitHub Repository Backup & Indexing ---
+ENABLE_GIT_BACKUP=true
+GIT_BACKUP_REPO_PATH="C:/Users/Andrew/Documents/github/York210-Controller"
+GIT_BACKUP_SUBDIR="auto"
+GIT_AUTO_PUSH=true
 ```
 
-### 5. Run an Initial Test
+### 5. Configuration Options Reference
 
-Run the Python script once manually from the command prompt to verify your credentials and path discovery:
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `GARMIN_EMAIL` | _(required)_ | Garmin Connect username or email. |
+| `GARMIN_PASSWORD` | _(required)_ | Garmin Connect account password. |
+| `ATHLETE_FTP` | `150` | Functional Threshold Power in Watts for IF/TSS calculations. |
+| `MYWHOOSH_PROFILE_NAME` | _(blank)_ | Athlete name filter. Skips files matching other athlete profiles. |
+| `MYWHOOSH_WORKOUTS_DIR` | _(auto)_ | Custom path override for MyWhoosh workout directory. |
+| `ARCHIVE_DIR` | _(auto)_ | Custom path override for processed file archive folder. |
+| `UPDATE_GARMIN_METADATA` | `true` | Update Garmin activity title and description with workout details. |
+| `APPEND_MYWHOOSHINFO_URL`| `true` | Include MyWhooshInfo workout link in Garmin activity description. |
+| `ENABLE_GIT_BACKUP` | `true` | Enable automated `.fit` backup and telemetry cataloging in Git. |
+| `GIT_BACKUP_REPO_PATH` | _(blank)_ | Path to local Git repository for ride/activity backups and index files. |
+| `GIT_BACKUP_SUBDIR` | `auto` | Subdirectory inside repository: `auto` (routes to `cycling/` and `rowing/`), custom folder name (e.g. `rides`), or empty `""` for repo root. |
+| `GIT_AUTO_PUSH` | `true` | Automatically run `git push` after committing activity backups. |
+
+
+### 6. Run an Initial Test
+
+Run the Python script once manually from the command prompt to verify credentials, upload, and backup:
 
 ```cmd
 python myWhoosh2Garmin.py
@@ -85,6 +117,26 @@ Check `sync.log` to confirm successful execution:
 ```cmd
 type sync.log
 ```
+
+---
+
+## 📊 Telemetry Indexing & Backup Structure
+
+When `ENABLE_GIT_BACKUP=true` is set, rides are automatically archived into the target Git repository:
+
+```
+GIT_BACKUP_REPO_PATH/
+├── rides/
+│   └── 2026/
+│       └── 10/
+│           └── 2026-10-06-08-30-00.fit
+├── rides_summary.csv
+└── rides_index.json
+```
+
+### `rides_summary.csv` Schema
+The catalog contains the following columns for easy spreadsheet and dashboard analysis:
+* `Date`, `ActivityID`, `Workout Name`, `MyWhooshInfo URL`, `Duration (s)`, `Distance (km)`, `Avg Power (W)`, `NP (W)`, `Max Power (W)`, `Avg Cadence (RPM)`, `Avg HR (BPM)`, `TSS`, `IF`, `Work (kJ)`, `Fit Filename`
 
 ---
 
@@ -124,7 +176,7 @@ MyWhoosh2Garmin/
 ├── .env                  # Your private credentials & configuration (git-ignored)
 ├── .env.example          # Template configuration
 ├── .gitignore            # Git ignore rules for logs, tokens, and archives
-├── myWhoosh2Garmin.py    # Main synchronization and FIT spoofing engine
+├── myWhoosh2Garmin.py    # Main synchronization, enrichment, and backup engine
 ├── requirements.txt      # Python package dependencies
 ├── run_sync_silent.vbs   # Silent wrapper script for Task Scheduler
 ├── sync.log              # Rolling execution log file
@@ -147,4 +199,6 @@ When MyWhoosh finishes an activity, it writes the athlete's friendly name to the
 
 * [Garth by matin](https://github.com/matin/garth) - Garmin Connect authentication and upload API.
 * [fit_tool](https://pypi.org/project/fit-tool/) - FIT file parsing and binary manipulation.
+* [MyWhooshInfo](https://mywhooshinfo.com) - Workout catalog and community database.
 * License: GPL-3.0
+

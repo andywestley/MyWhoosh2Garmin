@@ -5,11 +5,16 @@ Usage: python myWhoosh2Garmin.py
 Description:
     1. Scans for MyWhoosh workout .fit files.
     2. Performs device spoofing so Garmin Connect recognizes the device as a 'Garmin Edge 1030 Plus'.
-    3. Calculates average cadence, power, heart rate if missing, and strips unwanted fields.
+    3. Calculates average cadence, power, heart rate, Normalized Power (NP®), Intensity Factor (IF®),
+       Training Stress Score (TSS®), and total work (kJ), and strips unwanted fields.
     4. Supports multi-user profile filtering (via MYWHOOSH_PROFILE_NAME in .env).
-    5. Authenticates and uploads to Garmin Connect using Garth.
-    6. Moves processed/uploaded .fit files to an 'Archive' directory to prevent duplicate uploads.
-    7. Logs all events, successes, errors, and auth failures to sync.log.
+    5. Extracts workout titles and generates MyWhooshInfo.com workout URLs.
+    6. Authenticates and uploads to Garmin Connect using Garth.
+    7. Enriches Garmin Connect activity titles and notes with workout details & Coggan metrics.
+    8. Automatically backs up .fit files to a structured Git repository (year/month) and updates
+       an append-only rides_summary.csv and rides_index.json catalog with auto git commit/push.
+    9. Moves processed/uploaded .fit files to an 'Archive' directory to prevent duplicate uploads.
+    10. Logs all events, successes, errors, and auth failures to sync.log.
 """
 
 import os
@@ -18,13 +23,17 @@ import shutil
 import logging
 from pathlib import Path
 import warnings
+import re
+import csv
+import json
+import subprocess
 from datetime import datetime
 from getpass import getpass
-from typing import List, Optional
+from typing import List, Optional, Tuple, Any, Dict
+from dataclasses import dataclass, asdict
 
 # Suppress library deprecation notices in output
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -59,10 +68,13 @@ try:
     from garth.exc import GarthException, GarthHTTPError
     from fit_tool.fit_file import FitFile
     from fit_tool.fit_file_builder import FitFileBuilder
-    from fit_tool.profile.profile_type import Manufacturer, GarminProduct
+    from fit_tool.profile.profile_type import Manufacturer, GarminProduct, Sport, SubSport
     from fit_tool.profile.messages.file_id_message import FileIdMessage
     from fit_tool.profile.messages.device_info_message import DeviceInfoMessage
     from fit_tool.profile.messages.user_profile_message import UserProfileMessage
+    from fit_tool.profile.messages.workout_message import WorkoutMessage
+    from fit_tool.profile.messages.workout_step_message import WorkoutStepMessage
+    from fit_tool.profile.messages.course_message import CourseMessage
     from fit_tool.profile.messages.record_message import (
         RecordMessage,
         RecordTemperatureField,
@@ -77,10 +89,77 @@ except ImportError as e:
 TOKENS_PATH = SCRIPT_DIR / ".garth"
 MYWHOOSH_PREFIX_WINDOWS = "MyWhooshTechnologyService."
 
+SUMMARY_CSV_HEADERS = [
+    "Date",
+    "ActivityID",
+    "Sport",
+    "Workout Name",
+    "MyWhooshInfo URL",
+    "Duration (s)",
+    "Distance (km)",
+    "Avg Power (W)",
+    "NP (W)",
+    "Max Power (W)",
+    "Avg Cadence (RPM)",
+    "Avg HR (BPM)",
+    "TSS",
+    "IF",
+    "Work (kJ)",
+    "Fit Filename",
+]
+
+GENERIC_ACTIVITY_NAMES = {
+    "indoor cycling",
+    "cycling",
+    "virtual cycling",
+    "indoor rowing",
+    "rowing",
+    "activity",
+    "biking",
+    "mywhoosh",
+    "edge 1030 plus",
+    "garmin edge",
+    "garmin connect",
+    "workout",
+    "ride",
+}
+
+
+@dataclass
+class RideTelemetry:
+    """Encapsulates all computed and extracted ride/activity telemetry."""
+    date_str: str               # "YYYY-MM-DD HH:MM:SS"
+    activity_id: str            # Garmin Connect Activity ID (or "")
+    sport: str                  # e.g. "Cycling", "Rowing"
+    workout_name: str           # e.g. "Spiked Aerobic #1"
+    mywhooshinfo_url: str       # e.g. "https://mywhooshinfo.com/workouts/workout/spiked-aerobic-1"
+    duration_sec: int           # Total duration in seconds
+    distance_km: float          # Distance in kilometers
+    avg_power: int              # Average Power in Watts
+    np_power: int               # Normalized Power in Watts
+    max_power: int              # Maximum Power in Watts
+    avg_cadence: int            # Average Cadence in RPM / SPM
+    avg_hr: int                 # Average Heart Rate in BPM
+    tss: float                  # Training Stress Score
+    intensity_factor: float     # Intensity Factor
+    work_kj: int                # Total work in kJ
+    fit_filename: str           # Source .fit filename
+    year: str                   # "YYYY"
+    month: str                  # "MM"
+
+
 # Environment Configuration
 def _get_env_clean(key: str, default: str = "") -> str:
     val = os.getenv(key, default) or ""
     return val.strip().strip("\"'")
+
+
+def _get_bool_env(key: str, default: bool = True) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("true", "1", "yes", "y", "t", "on")
+
 
 GARMIN_EMAIL = _get_env_clean("GARMIN_EMAIL") or _get_env_clean("GARMIN_USERNAME")
 GARMIN_PASSWORD = _get_env_clean("GARMIN_PASSWORD")
@@ -95,6 +174,171 @@ except ValueError:
     logger.warning(f"Invalid ATHLETE_FTP value '{raw_ftp}' in .env. Defaulting to 0.")
     ATHLETE_FTP = 0
 
+# Garmin Activity Metadata Enrichment
+UPDATE_GARMIN_METADATA = _get_bool_env("UPDATE_GARMIN_METADATA", default=True)
+APPEND_MYWHOOSHINFO_URL = _get_bool_env("APPEND_MYWHOOSHINFO_URL", default=True)
+
+# GitHub Repository Backup & Indexing
+ENABLE_GIT_BACKUP = _get_bool_env("ENABLE_GIT_BACKUP", default=True)
+GIT_BACKUP_REPO_PATH = _get_env_clean("GIT_BACKUP_REPO_PATH")
+GIT_BACKUP_SUBDIR = _get_env_clean("GIT_BACKUP_SUBDIR", default="auto")
+GIT_AUTO_PUSH = _get_bool_env("GIT_AUTO_PUSH", default=True)
+
+
+def extract_fit_sport(fit_file: FitFile) -> Tuple[str, str, int, str]:
+    """
+    Detects the sport from SessionMessage.
+    Returns (sport_name, sport_dir, spoof_product_id, spoof_product_name)
+    e.g. ("Cycling", "cycling", GarminProduct.EDGE_1030_PLUS.value, "Edge 1030 Plus")
+    or   ("Rowing", "rowing", GarminProduct.FENIX7.value, "Fenix 7")
+    """
+    for record in fit_file.records:
+        msg = record.message
+        if isinstance(msg, SessionMessage):
+            sport_val = getattr(msg, "sport", None)
+            sub_sport_val = getattr(msg, "sub_sport", None)
+            if sport_val == Sport.ROWING.value or sub_sport_val == SubSport.INDOOR_ROWING.value:
+                return "Rowing", "rowing", GarminProduct.FENIX7.value, "Fenix 7"
+            if sport_val == Sport.CYCLING.value or sub_sport_val in (
+                SubSport.INDOOR_CYCLING.value,
+                SubSport.VIRTUAL_ACTIVITY.value,
+            ):
+                return "Cycling", "cycling", GarminProduct.EDGE_1030_PLUS.value, "Edge 1030 Plus"
+
+    return "Cycling", "cycling", GarminProduct.EDGE_1030_PLUS.value, "Edge 1030 Plus"
+
+
+
+def parse_fit_timestamp(ts: Optional[int], fallback_time: Optional[float] = None) -> datetime:
+    """Parses integer/float FIT timestamp into a datetime object."""
+    if ts is not None and ts > 0:
+        if ts > 100_000_000_000:
+            return datetime.fromtimestamp(ts / 1000.0)
+        elif ts > 100_000_000:
+            return datetime.fromtimestamp(ts)
+        else:
+            return datetime.fromtimestamp(ts + 631065600)
+    if fallback_time:
+        return datetime.fromtimestamp(fallback_time)
+    return datetime.now()
+
+
+def clean_extracted_name(name: Any) -> Optional[str]:
+    """Cleans up a candidate workout name, ignoring generic or empty titles."""
+    if not name:
+        return None
+    val = str(name).strip()
+    if not val or val.lower() in GENERIC_ACTIVITY_NAMES:
+        return None
+    return val
+
+
+def extract_workout_name(fit_file: FitFile, fallback_stem: str, ride_date_str: str) -> str:
+    """
+    Extracts workout title from FIT records:
+    1. WorkoutMessage.workout_name / WorkoutMessage.name
+    2. General message field scan for workout_name / wkt_name / workout_title / program_name
+    3. SessionMessage.name / SessionMessage.sport_profile_name
+    4. CourseMessage.name
+    5. FileIdMessage.name
+    6. Fallback to formatted filename stem or date string
+    """
+    # 1. WorkoutMessage
+    for record in fit_file.records:
+        msg = record.message
+        if isinstance(msg, WorkoutMessage):
+            w_name = clean_extracted_name(getattr(msg, "workout_name", None)) or clean_extracted_name(
+                getattr(msg, "name", None)
+            )
+            if w_name:
+                return w_name
+
+    # 2. General field scan across all message records
+    for record in fit_file.records:
+        msg = record.message
+        for attr in ("workout_name", "wkt_name", "workout_title", "program_name"):
+            if hasattr(msg, attr):
+                val = clean_extracted_name(getattr(msg, attr, None))
+                if val:
+                    return val
+
+    # 3. SessionMessage
+    for record in fit_file.records:
+        msg = record.message
+        if isinstance(msg, SessionMessage):
+            s_name = clean_extracted_name(getattr(msg, "name", None)) or clean_extracted_name(
+                getattr(msg, "sport_profile_name", None)
+            )
+            if s_name:
+                return s_name
+
+    # 4. CourseMessage
+    for record in fit_file.records:
+        msg = record.message
+        if isinstance(msg, CourseMessage):
+            c_name = clean_extracted_name(getattr(msg, "name", None))
+            if c_name:
+                return c_name
+
+    # 5. FileIdMessage
+    for record in fit_file.records:
+        msg = record.message
+        if isinstance(msg, FileIdMessage):
+            f_name = clean_extracted_name(getattr(msg, "name", None))
+            if f_name:
+                return f_name
+
+    # 6. Fallback from filename stem or date
+    if fallback_stem:
+        if re.match(r"^\d{4}[-_]\d{2}[-_]\d{2}", fallback_stem):
+            return f"MyWhoosh Ride ({ride_date_str})"
+        cleaned_stem = re.sub(r"[-_]+", " ", fallback_stem).strip()
+        if cleaned_stem:
+            return cleaned_stem.title()
+
+    return f"MyWhoosh Ride ({ride_date_str})"
+
+
+def generate_workout_slug(workout_name: str) -> str:
+    """
+    Generates a normalized URL slug for MyWhooshInfo from workout name:
+    e.g. 'Spiked Aerobic #1' -> 'spiked-aerobic-1', 'Into the Red!' -> 'into-the-red'
+    """
+    if not workout_name:
+        return ""
+    slug = workout_name.lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-")
+
+
+def get_mywhooshinfo_url(workout_name: str) -> str:
+    """
+    Constructs the MyWhooshInfo workout details URL.
+    """
+    slug = generate_workout_slug(workout_name)
+    if not slug:
+        return ""
+    return f"https://mywhooshinfo.com/workouts/workout/{slug}"
+
+
+def extract_fit_timestamp(fit_file: FitFile, fallback_mtime: Optional[float] = None) -> datetime:
+    """
+    Extracts start datetime from SessionMessage, FileIdMessage, or file modification time.
+    """
+    for record in fit_file.records:
+        msg = record.message
+        if isinstance(msg, SessionMessage):
+            st = getattr(msg, "start_time", None) or getattr(msg, "timestamp", None)
+            if st:
+                return parse_fit_timestamp(st, fallback_mtime)
+        elif isinstance(msg, FileIdMessage):
+            tc = getattr(msg, "time_created", None)
+            if tc:
+                return parse_fit_timestamp(tc, fallback_mtime)
+
+    if fallback_mtime:
+        return datetime.fromtimestamp(fallback_mtime)
+    return datetime.now()
 
 
 def get_fitfile_location() -> Optional[Path]:
@@ -251,7 +495,6 @@ def calculate_normalized_power(power_values: list) -> int:
     if len(power_values) < 30:
         return calculate_avg(power_values)
 
-    # 30-second rolling moving average
     rolling_30s = []
     window_sum = sum(power_values[:30])
     rolling_30s.append(window_sum / 30.0)
@@ -289,16 +532,8 @@ def calculate_total_work_joules(power_values: list, duration_sec: Optional[int] 
     return round(avg_p * dur)
 
 
-def append_value(values: list, message: object, field_name: str) -> None:
-    """Appends field value from message if present and truthy, else 0."""
-    value = getattr(message, field_name, None)
-    values.append(value if value is not None else 0)
-
-
 def extract_fit_profile_name(fit_file: FitFile) -> Optional[str]:
-    """
-    Extracts athlete/profile friendly name from FIT records if present.
-    """
+    """Extracts athlete/profile friendly name from FIT records if present."""
     for record in fit_file.records:
         msg = record.message
         if isinstance(msg, UserProfileMessage):
@@ -309,9 +544,7 @@ def extract_fit_profile_name(fit_file: FitFile) -> Optional[str]:
 
 
 def extract_fit_ftp(fit_file: FitFile) -> Optional[int]:
-    """
-    Extracts configured FTP/threshold power from FIT records if present.
-    """
+    """Extracts configured FTP/threshold power from FIT records if present."""
     for record in fit_file.records:
         msg = record.message
         if hasattr(msg, "functional_threshold_power") and getattr(msg, "functional_threshold_power", None):
@@ -341,19 +574,19 @@ def clone_message(old_msg: object, msg_class: type) -> object:
 
 def process_and_spoof_fit_file(
     input_fit_path: Path, output_fit_path: Path, expected_profile: Optional[str] = None
-) -> bool:
+) -> Tuple[bool, Optional[RideTelemetry]]:
     """
     Parses, validates profile, calculates advanced cycling metrics (NP, IF, TSS, Work, FTP),
-    cleans up metrics, and applies Garmin Edge 1030 Plus device spoofing.
+    cleans up metrics, applies Garmin Edge 1030 Plus device spoofing, and extracts full ride telemetry.
 
     Returns:
-        bool: True if processed successfully, False if skipped (e.g. mismatched profile) or on error.
+        (bool, Optional[RideTelemetry]): (True, telemetry) if successful, (False, None) otherwise.
     """
     try:
         fit_file = FitFile.from_file(str(input_fit_path))
     except Exception as e:
         logger.error(f"Failed to read FIT file {input_fit_path.name}: {e}")
-        return False
+        return False, None
 
     # Multi-User Profile Check
     if expected_profile:
@@ -364,7 +597,7 @@ def process_and_spoof_fit_file(
                     f"Skipping '{input_fit_path.name}': Athlete profile '{file_profile}' "
                     f"does not match configured target profile '{expected_profile}'."
                 )
-                return False
+                return False, None
             logger.info(f"Validated athlete profile match: '{file_profile}'")
         else:
             logger.info(f"No athlete profile name embedded in {input_fit_path.name}. Proceeding with processing.")
@@ -377,6 +610,18 @@ def process_and_spoof_fit_file(
     else:
         logger.warning("No FTP configured or found in FIT file. Set ATHLETE_FTP in .env for TSS/IF calculations.")
 
+    # Detect Sport & Dynamic Device Spoofing (e.g. Edge 1030 Plus for Cycling, Fenix 7 for Rowing)
+    sport_name, sport_dir, spoof_product_id, spoof_product_name = extract_fit_sport(fit_file)
+    logger.info(f"Detected Activity Sport: '{sport_name}' -> Spoofing as Garmin {spoof_product_name}")
+
+    # Extract Ride Start Date & Workout Title
+    ride_dt = extract_fit_timestamp(fit_file, fallback_mtime=input_fit_path.stat().st_mtime)
+    ride_date_str = ride_dt.strftime("%Y-%m-%d %H:%M:%S")
+    workout_title = extract_workout_name(fit_file, input_fit_path.stem, ride_date_str)
+    mywhooshinfo_url = get_mywhooshinfo_url(workout_title)
+
+    logger.info(f"Extracted Workout Title: '{workout_title}' | Slug URL: {mywhooshinfo_url}")
+
     builder = FitFileBuilder()
 
     # Lap-level and Session-level metric accumulators
@@ -388,6 +633,9 @@ def process_and_spoof_fit_file(
     session_power_values: List[int] = []
     session_heart_rate_values: List[int] = []
 
+    total_distance_m = 0.0
+    session_dur_val = 0
+
     for record in fit_file.records:
         message = record.message
 
@@ -398,12 +646,12 @@ def process_and_spoof_fit_file(
             except Exception:
                 pass
             try:
-                message.product = GarminProduct.EDGE_1030_PLUS.value
+                message.product = spoof_product_id
             except Exception:
                 pass
             if hasattr(message, "garmin_product"):
                 try:
-                    message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+                    message.garmin_product = spoof_product_id
                 except Exception:
                     pass
 
@@ -414,16 +662,16 @@ def process_and_spoof_fit_file(
             except Exception:
                 pass
             try:
-                message.product = GarminProduct.EDGE_1030_PLUS.value
+                message.product = spoof_product_id
             except Exception:
                 pass
             if hasattr(message, "garmin_product"):
                 try:
-                    message.garmin_product = GarminProduct.EDGE_1030_PLUS.value
+                    message.garmin_product = spoof_product_id
                 except Exception:
                     pass
             try:
-                message.product_name = "Edge 1030 Plus"
+                message.product_name = spoof_product_name
             except Exception:
                 pass
 
@@ -446,6 +694,7 @@ def process_and_spoof_fit_file(
             p_val = getattr(message, "power", None)
             c_val = getattr(message, "cadence", None)
             hr_val = getattr(message, "heart_rate", None)
+            d_val = getattr(message, "distance", None)
 
             if p_val is not None:
                 lap_power_values.append(p_val)
@@ -456,6 +705,8 @@ def process_and_spoof_fit_file(
             if hr_val is not None:
                 lap_heart_rate_values.append(hr_val)
                 session_heart_rate_values.append(hr_val)
+            if d_val is not None and float(d_val) > total_distance_m:
+                total_distance_m = float(d_val)
 
         # 5. Lap Message: Populate missing averages & power metrics
         elif isinstance(message, LapMessage):
@@ -478,7 +729,11 @@ def process_and_spoof_fit_file(
                     pass
                 try:
                     if not getattr(message, "total_work", None):
-                        lap_dur = getattr(message, "total_timer_time", None) or getattr(message, "total_elapsed_time", None) or len(lap_power_values)
+                        lap_dur = (
+                            getattr(message, "total_timer_time", None)
+                            or getattr(message, "total_elapsed_time", None)
+                            or len(lap_power_values)
+                        )
                         message.total_work = calculate_total_work_joules(lap_power_values, lap_dur)
                 except Exception:
                     pass
@@ -513,6 +768,16 @@ def process_and_spoof_fit_file(
         # 6. Session Message: Populate missing averages, NP, IF, TSS, Work, and FTP
         elif isinstance(message, SessionMessage):
             message = clone_message(message, SessionMessage)
+            s_dist = getattr(message, "total_distance", None)
+            if s_dist is not None:
+                total_distance_m = float(s_dist)
+
+            session_dur_val = (
+                getattr(message, "total_timer_time", None)
+                or getattr(message, "total_elapsed_time", None)
+                or len(session_power_values)
+            )
+
             if session_power_values:
                 try:
                     if not getattr(message, "avg_power", None):
@@ -524,7 +789,7 @@ def process_and_spoof_fit_file(
                         message.max_power = max(session_power_values)
                 except Exception:
                     pass
-                
+
                 # Normalized Power (NP)
                 np_val = calculate_normalized_power(session_power_values)
                 try:
@@ -533,9 +798,8 @@ def process_and_spoof_fit_file(
                     pass
 
                 # Total Work (Joules)
-                session_dur = getattr(message, "total_timer_time", None) or getattr(message, "total_elapsed_time", None) or len(session_power_values)
                 try:
-                    message.total_work = calculate_total_work_joules(session_power_values, session_dur)
+                    message.total_work = calculate_total_work_joules(session_power_values, session_dur_val)
                 except Exception:
                     pass
 
@@ -545,14 +809,21 @@ def process_and_spoof_fit_file(
                         message.threshold_power = effective_ftp
                     except Exception:
                         pass
-                    
-                    if_val = calculate_intensity_factor(np_val or calculate_avg(session_power_values), effective_ftp)
+
+                    if_val = calculate_intensity_factor(
+                        np_val or calculate_avg(session_power_values), effective_ftp
+                    )
                     try:
                         message.intensity_factor = if_val
                     except Exception:
                         pass
 
-                    tss_val = calculate_tss(session_dur, np_val or calculate_avg(session_power_values), if_val, effective_ftp)
+                    tss_val = calculate_tss(
+                        session_dur_val,
+                        np_val or calculate_avg(session_power_values),
+                        if_val,
+                        effective_ftp,
+                    )
                     try:
                         message.training_stress_score = tss_val
                     except Exception:
@@ -594,12 +865,47 @@ def process_and_spoof_fit_file(
     try:
         output_fit_path.parent.mkdir(parents=True, exist_ok=True)
         builder.build().to_file(str(output_fit_path))
-        logger.info(f"Successfully processed and spoofed '{input_fit_path.name}' -> Garmin Edge 1030 Plus.")
-        return True
+        logger.info(f"Successfully processed and spoofed '{input_fit_path.name}' -> Garmin {spoof_product_name} ({sport_name}).")
     except Exception as e:
         logger.error(f"Failed to write processed FIT file {output_fit_path.name}: {e}")
-        return False
+        return False, None
 
+    # Compile Final Ride Telemetry
+    np_final = calculate_normalized_power(session_power_values)
+    avg_p_final = calculate_avg(session_power_values)
+    max_p_final = max(session_power_values) if session_power_values else 0
+    avg_c_final = calculate_avg(session_cadence_values)
+    avg_hr_final = calculate_avg(session_heart_rate_values)
+    dur_final = int(session_dur_val) if session_dur_val else len(session_power_values)
+    dist_km_final = round(total_distance_m / 1000.0, 2)
+    work_j_final = calculate_total_work_joules(session_power_values, dur_final)
+    work_kj_final = round(work_j_final / 1000.0)
+
+    if_final = calculate_intensity_factor(np_final or avg_p_final, effective_ftp)
+    tss_final = calculate_tss(dur_final, np_final or avg_p_final, if_final, effective_ftp)
+
+    telemetry = RideTelemetry(
+        date_str=ride_date_str,
+        activity_id="",
+        sport=sport_name,
+        workout_name=workout_title,
+        mywhooshinfo_url=mywhooshinfo_url,
+        duration_sec=dur_final,
+        distance_km=dist_km_final,
+        avg_power=avg_p_final,
+        np_power=np_final,
+        max_power=max_p_final,
+        avg_cadence=avg_c_final,
+        avg_hr=avg_hr_final,
+        tss=tss_final,
+        intensity_factor=if_final,
+        work_kj=work_kj_final,
+        fit_filename=input_fit_path.name,
+        year=ride_dt.strftime("%Y"),
+        month=ride_dt.strftime("%m"),
+    )
+
+    return True, telemetry
 
 
 def archive_file(source_file: Path, archive_dir: Path) -> Optional[Path]:
@@ -622,29 +928,376 @@ def archive_file(source_file: Path, archive_dir: Path) -> Optional[Path]:
         return None
 
 
-def upload_fit_file_to_garmin(file_path: Path) -> bool:
+def extract_activity_id_from_upload_response(upload_res: Any) -> Optional[int]:
+    """
+    Extracts the Garmin activityId from garth.client.upload response dict.
+    """
+    if not upload_res or not isinstance(upload_res, dict):
+        return None
+
+    # 1. detailedImportResult
+    detail = upload_res.get("detailedImportResult")
+    if isinstance(detail, dict):
+        if detail.get("internalId"):
+            try:
+                return int(detail["internalId"])
+            except (ValueError, TypeError):
+                pass
+        if detail.get("activityId"):
+            try:
+                return int(detail["activityId"])
+            except (ValueError, TypeError):
+                pass
+        successes = detail.get("successes")
+        if isinstance(successes, list) and successes:
+            for item in successes:
+                if isinstance(item, dict):
+                    if item.get("internalId"):
+                        return int(item["internalId"])
+                    if item.get("activityId"):
+                        return int(item["activityId"])
+
+    # 2. Top-level keys
+    for key in ("activityId", "internalId", "id", "activity_id"):
+        if key in upload_res and upload_res[key]:
+            try:
+                return int(upload_res[key])
+            except (ValueError, TypeError):
+                pass
+
+    return None
+
+
+def get_latest_garmin_activity_id() -> Optional[int]:
+    """
+    Fetches the most recent activity ID from Garmin Connect API as a fallback.
+    """
+    try:
+        activities = garth.client.connectapi(
+            "/activitylist-service/activities/search/activities",
+            params={"limit": 1},
+        )
+        if isinstance(activities, list) and len(activities) > 0:
+            act = activities[0]
+            if isinstance(act, dict) and "activityId" in act:
+                act_id = int(act["activityId"])
+                logger.info(f"Retrieved latest Garmin activity ID via Connect API: {act_id}")
+                return act_id
+    except Exception as e:
+        logger.warning(f"Could not retrieve latest activity from Garmin Connect API: {e}")
+    return None
+
+
+def update_garmin_activity_metadata(
+    activity_id: int,
+    workout_name: str,
+    slug: str,
+    np_val: int,
+    if_val: float,
+    tss_val: float,
+    work_kj: int,
+    append_url: bool = True,
+) -> bool:
+    """
+    Updates the Garmin activity title and description with workout details & Coggan metrics.
+    """
+    lines = [f"Workout: {workout_name}"]
+    if append_url and slug:
+        lines.append(f"Details: https://mywhooshinfo.com/workouts/workout/{slug}")
+    lines.append(f"Metrics: NP: {np_val}W | IF: {if_val} | TSS: {tss_val} | Work: {work_kj}kJ")
+    description = "\n".join(lines)
+
+    endpoint = f"/activity-service/activity/{activity_id}"
+    payload = {
+        "activityId": activity_id,
+        "activityName": workout_name,
+        "description": description,
+    }
+    try:
+        garth.client.connectapi(endpoint, method="PUT", json=payload)
+        logger.info(
+            f"Successfully enriched Garmin activity {activity_id}: "
+            f"Title='{workout_name}', Description=\n{description}"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to update metadata for Garmin activity {activity_id}: {e}")
+        return False
+
+
+def upload_fit_file_to_garmin(file_path: Path) -> Tuple[bool, Optional[int]]:
     """
     Uploads a .fit file to Garmin Connect using Garth.
-    Returns True if uploaded successfully or recognized as duplicate on Garmin.
+    Returns (success: bool, activity_id: Optional[int]).
     """
     try:
         with open(file_path, "rb") as f:
             uploaded = garth.client.upload(f)
             logger.info(f"Successfully uploaded {file_path.name} to Garmin Connect! (Response: {uploaded})")
-            return True
+            act_id = extract_activity_id_from_upload_response(uploaded)
+            if not act_id:
+                act_id = get_latest_garmin_activity_id()
+            return True, act_id
     except GarthHTTPError as e:
         # HTTP 409 or duplicate activity error
         if "409" in str(e) or "duplicate" in str(e).lower():
             logger.warning(f"Activity {file_path.name} already exists on Garmin Connect (duplicate detected).")
-            return True
+            act_id = get_latest_garmin_activity_id()
+            return True, act_id
         err_detail = ""
         if hasattr(e, "error") and hasattr(e.error, "response") and e.error.response is not None:
             err_detail = f" | Details: {e.error.response.text}"
         logger.error(f"Garmin HTTP upload error for {file_path.name}: {e}{err_detail}")
-        return False
+        return False, None
     except Exception as e:
         logger.error(f"Garmin upload failed for {file_path.name}: {e}")
+        return False, None
+
+
+def update_rides_catalog(backup_dir: Path, telemetry: RideTelemetry) -> None:
+    """
+    Maintains append-only / updated rides_summary.csv and rides_index.json in the backup repository.
+    """
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = backup_dir / "rides_summary.csv"
+    json_path = backup_dir / "rides_index.json"
+
+    row_dict = {
+        "Date": telemetry.date_str,
+        "ActivityID": str(telemetry.activity_id) if telemetry.activity_id else "",
+        "Sport": telemetry.sport,
+        "Workout Name": telemetry.workout_name,
+        "MyWhooshInfo URL": telemetry.mywhooshinfo_url,
+        "Duration (s)": telemetry.duration_sec,
+        "Distance (km)": telemetry.distance_km,
+        "Avg Power (W)": telemetry.avg_power,
+        "NP (W)": telemetry.np_power,
+        "Max Power (W)": telemetry.max_power,
+        "Avg Cadence (RPM)": telemetry.avg_cadence,
+        "Avg HR (BPM)": telemetry.avg_hr,
+        "TSS": telemetry.tss,
+        "IF": telemetry.intensity_factor,
+        "Work (kJ)": telemetry.work_kj,
+        "Fit Filename": telemetry.fit_filename,
+    }
+
+    # 1. Update CSV Catalog
+    csv_rows = []
+    csv_updated = False
+    if csv_path.exists():
+        try:
+            with open(csv_path, mode="r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    if (
+                        (telemetry.fit_filename and r.get("Fit Filename") == telemetry.fit_filename)
+                        or (telemetry.activity_id and r.get("ActivityID") == str(telemetry.activity_id))
+                    ):
+                        csv_rows.append(row_dict)
+                        csv_updated = True
+                    else:
+                        csv_rows.append(r)
+        except Exception as e:
+            logger.warning(f"Error reading existing CSV catalog '{csv_path.name}': {e}")
+
+    if not csv_updated:
+        csv_rows.append(row_dict)
+
+    try:
+        with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=SUMMARY_CSV_HEADERS)
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        logger.info(f"Updated ride summary catalog: '{csv_path}'.")
+    except Exception as e:
+        logger.error(f"Failed to write ride summary catalog '{csv_path}': {e}")
+
+    # 2. Update JSON Index
+    json_entries = []
+    json_updated = False
+    if json_path.exists():
+        try:
+            with open(json_path, mode="r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    json_entries = data
+        except Exception as e:
+            logger.warning(f"Error reading existing JSON index '{json_path.name}': {e}")
+
+    for idx, entry in enumerate(json_entries):
+        if isinstance(entry, dict) and (
+            (telemetry.fit_filename and entry.get("Fit Filename") == telemetry.fit_filename)
+            or (telemetry.activity_id and entry.get("ActivityID") == str(telemetry.activity_id))
+        ):
+            json_entries[idx] = row_dict
+            json_updated = True
+            break
+
+    if not json_updated:
+        json_entries.append(row_dict)
+
+    try:
+        with open(json_path, mode="w", encoding="utf-8") as f:
+            json.dump(json_entries, f, indent=2)
+        logger.info(f"Updated ride JSON index: '{json_path}'.")
+    except Exception as e:
+        logger.error(f"Failed to write ride JSON index '{json_path}': {e}")
+
+
+def git_backup_repository(
+    repo_path: Path,
+    workout_name: str,
+    ride_date_str: str,
+    sport_name: str = "activity",
+    auto_push: bool = True,
+) -> bool:
+    """
+    Performs non-blocking git add, commit, and push within the target backup repository.
+    """
+    if not repo_path.is_dir():
+        logger.warning(f"Git backup skipped: Directory '{repo_path}' does not exist.")
         return False
+
+    if not (repo_path / ".git").exists():
+        logger.warning(f"Git backup skipped: '{repo_path}' is not a git repository (missing .git).")
+        return False
+
+    commit_msg = f"Auto-backup {sport_name.lower()}: {workout_name} ({ride_date_str})"
+
+    # 1. git add .
+    try:
+        add_res = subprocess.run(
+            ["git", "add", "."],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if add_res.returncode != 0:
+            logger.warning(f"git add failed in {repo_path}: {add_res.stderr.strip()}")
+            return False
+    except Exception as e:
+        logger.warning(f"Failed to execute git add in {repo_path}: {e}")
+        return False
+
+    # 2. Check git status
+    try:
+        status_res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if not status_res.stdout.strip():
+            logger.info("No changes to commit in git backup repository.")
+            return True
+    except Exception as e:
+        logger.warning(f"Failed to check git status in {repo_path}: {e}")
+
+    # 3. git commit
+    try:
+        commit_res = subprocess.run(
+            ["git", "commit", "-m", commit_msg],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit_res.returncode != 0:
+            logger.warning(f"git commit failed in {repo_path}: {commit_res.stderr.strip()}")
+            return False
+        logger.info(f"Committed git backup: '{commit_msg}'")
+    except Exception as e:
+        logger.warning(f"Failed to execute git commit in {repo_path}: {e}")
+        return False
+
+    # 4. git push
+    if auto_push:
+        try:
+            push_res = subprocess.run(
+                ["git", "push"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if push_res.returncode != 0:
+                logger.warning(
+                    f"git push failed in {repo_path} (offline or remote rejected): {push_res.stderr.strip()}"
+                )
+                return False
+            logger.info("Successfully pushed ride backup to remote git repository.")
+        except Exception as e:
+            logger.warning(f"Failed to execute git push in {repo_path}: {e}")
+            return False
+
+    return True
+
+
+def backup_and_index_ride(
+    source_fit_path: Path,
+    telemetry: RideTelemetry,
+    repo_path_str: str,
+    subdir_str: str,
+    auto_push: bool = True,
+) -> bool:
+    """
+    Copies FIT file to structured year/month folder in the backup repo, updates catalog, and commits.
+    """
+    if not repo_path_str:
+        logger.warning("Git ride backup skipped: GIT_BACKUP_REPO_PATH is not configured.")
+        return False
+
+    repo_path = Path(repo_path_str).expanduser().resolve()
+    if not repo_path.exists():
+        try:
+            repo_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not create GIT_BACKUP_REPO_PATH '{repo_path}': {e}")
+            return False
+
+    # Target folder:
+    # If subdir_str == "auto": use telemetry.sport.lower() (e.g. 'cycling', 'rowing')
+    # If subdir_str is custom: use that
+    # If subdir_str is empty/blank: use repo_path directly
+    target_dir = repo_path
+    if subdir_str and subdir_str.lower() == "auto":
+        target_dir = target_dir / telemetry.sport.lower()
+    elif subdir_str:
+        target_dir = target_dir / subdir_str
+
+    target_dir = target_dir / telemetry.year / telemetry.month
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dest_fit = target_dir / source_fit_path.name
+        shutil.copy2(str(source_fit_path), str(dest_fit))
+        logger.info(f"Backed up ride FIT file to '{dest_fit}'.")
+    except Exception as e:
+        logger.warning(f"Failed to copy FIT file to backup directory '{target_dir}': {e}")
+        return False
+
+    # Update rides_summary.csv and rides_index.json
+    try:
+        update_rides_catalog(repo_path, telemetry)
+    except Exception as e:
+        logger.warning(f"Failed to update ride catalog in '{repo_path}': {e}")
+
+    # Automated git commit & push
+    try:
+        git_backup_repository(
+            repo_path=repo_path,
+            workout_name=telemetry.workout_name,
+            ride_date_str=telemetry.date_str,
+            sport_name=telemetry.sport,
+            auto_push=auto_push,
+        )
+    except Exception as e:
+        logger.warning(f"Git auto-backup encountered an error: {e}")
+
+    return True
+
 
 
 def get_pending_fit_files(workout_dir: Path, archive_dir: Path) -> List[Path]:
@@ -653,7 +1306,6 @@ def get_pending_fit_files(workout_dir: Path, archive_dir: Path) -> List[Path]:
     """
     candidate_files = []
     for f in workout_dir.glob("*.fit"):
-        # Skip files already inside archive or subdirectories
         if f.is_file() and archive_dir not in f.parents and f.parent == workout_dir:
             candidate_files.append(f)
 
@@ -697,33 +1349,61 @@ def main():
             logger.info(f"Processing '{fit_path.name}'...")
             temp_output = temp_dir / fit_path.name
 
-            # Process, check athlete profile, and spoof as Garmin Edge 1030 Plus
-            processed = process_and_spoof_fit_file(
+            # Process, check athlete profile, extract telemetry, and spoof as Garmin Edge 1030 Plus
+            processed, telemetry = process_and_spoof_fit_file(
                 input_fit_path=fit_path,
                 output_fit_path=temp_output,
                 expected_profile=MYWHOOSH_PROFILE_NAME if MYWHOOSH_PROFILE_NAME else None,
             )
 
-
-            if not processed:
+            if not processed or telemetry is None:
                 # File was skipped due to profile mismatch or parsing failure
                 if temp_output.exists():
                     temp_output.unlink(missing_ok=True)
                 continue
 
             # Upload to Garmin Connect
-            upload_success = upload_fit_file_to_garmin(temp_output)
+            upload_success, activity_id = upload_fit_file_to_garmin(temp_output)
 
-            # Clean up temp file
-            if temp_output.exists():
-                temp_output.unlink(missing_ok=True)
-
-            # Archive the original workout file if successfully uploaded (or duplicate)
             if upload_success:
+                if activity_id:
+                    telemetry.activity_id = str(activity_id)
+
+                # Enrich Garmin Activity metadata (Title, description with MyWhooshInfo and metrics)
+                if UPDATE_GARMIN_METADATA and activity_id:
+                    update_garmin_activity_metadata(
+                        activity_id=activity_id,
+                        workout_name=telemetry.workout_name,
+                        slug=generate_workout_slug(telemetry.workout_name),
+                        np_val=telemetry.np_power,
+                        if_val=telemetry.intensity_factor,
+                        tss_val=telemetry.tss,
+                        work_kj=telemetry.work_kj,
+                        append_url=APPEND_MYWHOOSHINFO_URL,
+                    )
+
+                # Automated GitHub Ride Backup & Telemetry Indexing
+                if ENABLE_GIT_BACKUP and GIT_BACKUP_REPO_PATH:
+                    backup_file_target = temp_output if temp_output.exists() else fit_path
+                    backup_and_index_ride(
+                        source_fit_path=backup_file_target,
+                        telemetry=telemetry,
+                        repo_path_str=GIT_BACKUP_REPO_PATH,
+                        subdir_str=GIT_BACKUP_SUBDIR,
+                        auto_push=GIT_AUTO_PUSH,
+                    )
+
+                # Clean up temp file
+                if temp_output.exists():
+                    temp_output.unlink(missing_ok=True)
+
+                # Archive original workout file
                 archive_file(fit_path, archive_dir)
                 success_count += 1
             else:
                 logger.warning(f"File '{fit_path.name}' was not archived because upload failed.")
+                if temp_output.exists():
+                    temp_output.unlink(missing_ok=True)
 
     finally:
         # Clean up temp directory
