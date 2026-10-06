@@ -1253,7 +1253,19 @@ def git_backup_repository(
 
     commit_msg = f"Auto-backup {sport_name.lower()}: {workout_name} ({ride_date_str})"
 
-    # 1. git add .
+    # 1. git pull (to sync any remote deletions or edits from GitHub)
+    try:
+        subprocess.run(
+            ["git", "pull", "--rebase"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as e:
+        logger.debug(f"git pull skipped or failed in {repo_path}: {e}")
+
+    # 2. git add .
     try:
         add_res = subprocess.run(
             ["git", "add", "."],
