@@ -1240,6 +1240,16 @@ def git_backup_repository(
         logger.warning(f"Failed to check git status in {repo_path}: {e}")
 
     # 3. git commit
+    git_env = os.environ.copy()
+    if "GIT_AUTHOR_NAME" not in git_env or not git_env.get("GIT_AUTHOR_NAME"):
+        git_env["GIT_AUTHOR_NAME"] = MYWHOOSH_PROFILE_NAME or "MyWhoosh Sync"
+    if "GIT_AUTHOR_EMAIL" not in git_env or not git_env.get("GIT_AUTHOR_EMAIL"):
+        git_env["GIT_AUTHOR_EMAIL"] = GARMIN_EMAIL or "sync@mywhoosh2garmin.local"
+    if "GIT_COMMITTER_NAME" not in git_env or not git_env.get("GIT_COMMITTER_NAME"):
+        git_env["GIT_COMMITTER_NAME"] = MYWHOOSH_PROFILE_NAME or "MyWhoosh Sync"
+    if "GIT_COMMITTER_EMAIL" not in git_env or not git_env.get("GIT_COMMITTER_EMAIL"):
+        git_env["GIT_COMMITTER_EMAIL"] = GARMIN_EMAIL or "sync@mywhoosh2garmin.local"
+
     try:
         commit_res = subprocess.run(
             ["git", "commit", "-m", commit_msg],
@@ -1247,6 +1257,7 @@ def git_backup_repository(
             capture_output=True,
             text=True,
             check=False,
+            env=git_env,
         )
         if commit_res.returncode != 0:
             logger.warning(f"git commit failed in {repo_path}: {commit_res.stderr.strip()}")
