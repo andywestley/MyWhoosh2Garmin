@@ -123,6 +123,21 @@ GENERIC_ACTIVITY_NAMES = {
     "garmin connect",
     "workout",
     "ride",
+    "session",
+    "lap",
+    "record",
+    "event",
+    "course",
+    "file_id",
+    "file_creator",
+    "device_info",
+    "developer_data_id",
+    "field_description",
+    "user_profile",
+    "zones_target",
+    "mynewactivity",
+    "new activity",
+    "untitled",
 }
 
 
@@ -225,53 +240,58 @@ def parse_fit_timestamp(ts: Optional[int], fallback_time: Optional[float] = None
 
 
 def clean_extracted_name(name: Any) -> Optional[str]:
-    """Cleans up a candidate workout name, ignoring generic or empty titles."""
+    """Cleans up a candidate workout name, ignoring generic, internal, or empty titles."""
     if not name:
         return None
     val = str(name).strip()
-    if not val or val.lower() in GENERIC_ACTIVITY_NAMES:
+    if not val:
+        return None
+    val_lower = val.lower()
+    if val_lower in GENERIC_ACTIVITY_NAMES or val_lower.startswith("mynewactivity"):
         return None
     return val
 
 
-def extract_workout_name(fit_file: FitFile, fallback_stem: str, ride_date_str: str) -> str:
+def extract_workout_name(
+    fit_file: FitFile, fallback_stem: str, ride_date_str: str, sport_name: str = "Cycling"
+) -> Tuple[str, bool]:
     """
     Extracts workout title from FIT records:
-    1. WorkoutMessage.workout_name / WorkoutMessage.name
-    2. General message field scan for workout_name / wkt_name / workout_title / program_name
-    3. SessionMessage.name / SessionMessage.sport_profile_name
-    4. CourseMessage.name
-    5. FileIdMessage.name
-    6. Fallback to formatted filename stem or date string
+    1. WorkoutMessage.wkt_name / WorkoutMessage.workout_name
+    2. General message field scan for wkt_name / workout_name / workout_title / program_name
+    3. SessionMessage.sport_profile_name (ignoring SessionMessage.name which is library 'session')
+    4. CourseMessage.name (if non-generic)
+    5. Fallback from clean filename stem or formatted date string
+
+    Returns:
+        (workout_title: str, is_specific_workout: bool)
     """
     # 1. WorkoutMessage
     for record in fit_file.records:
         msg = record.message
         if isinstance(msg, WorkoutMessage):
-            w_name = clean_extracted_name(getattr(msg, "workout_name", None)) or clean_extracted_name(
-                getattr(msg, "name", None)
+            w_name = clean_extracted_name(getattr(msg, "wkt_name", None)) or clean_extracted_name(
+                getattr(msg, "workout_name", None)
             )
             if w_name:
-                return w_name
+                return w_name, True
 
     # 2. General field scan across all message records
     for record in fit_file.records:
         msg = record.message
-        for attr in ("workout_name", "wkt_name", "workout_title", "program_name"):
+        for attr in ("wkt_name", "workout_name", "workout_title", "program_name"):
             if hasattr(msg, attr):
                 val = clean_extracted_name(getattr(msg, attr, None))
                 if val:
-                    return val
+                    return val, True
 
-    # 3. SessionMessage
+    # 3. SessionMessage - inspect custom sport profile name (ignore internal fit_tool msg.name = 'session')
     for record in fit_file.records:
         msg = record.message
         if isinstance(msg, SessionMessage):
-            s_name = clean_extracted_name(getattr(msg, "name", None)) or clean_extracted_name(
-                getattr(msg, "sport_profile_name", None)
-            )
+            s_name = clean_extracted_name(getattr(msg, "sport_profile_name", None))
             if s_name:
-                return s_name
+                return s_name, True
 
     # 4. CourseMessage
     for record in fit_file.records:
@@ -279,42 +299,36 @@ def extract_workout_name(fit_file: FitFile, fallback_stem: str, ride_date_str: s
         if isinstance(msg, CourseMessage):
             c_name = clean_extracted_name(getattr(msg, "name", None))
             if c_name:
-                return c_name
+                return c_name, False
 
-    # 5. FileIdMessage
-    for record in fit_file.records:
-        msg = record.message
-        if isinstance(msg, FileIdMessage):
-            f_name = clean_extracted_name(getattr(msg, "name", None))
-            if f_name:
-                return f_name
-
-    # 6. Fallback from filename stem or date
+    # 5. Fallback from filename stem or date
     if fallback_stem:
-        if re.match(r"^\d{4}[-_]\d{2}[-_]\d{2}", fallback_stem):
-            return f"MyWhoosh Ride ({ride_date_str})"
-        cleaned_stem = re.sub(r"[-_]+", " ", fallback_stem).strip()
-        if cleaned_stem:
-            return cleaned_stem.title()
+        cleaned_stem = clean_extracted_name(re.sub(r"[-_]+", " ", fallback_stem).strip())
+        if cleaned_stem and not re.match(r"^\d{4}[-_ ]\d{2}[-_ ]\d{2}", cleaned_stem):
+            return cleaned_stem.title(), True
 
-    return f"MyWhoosh Ride ({ride_date_str})"
+    return f"MyWhoosh {sport_name} ({ride_date_str})", False
 
 
 def generate_workout_slug(workout_name: str) -> str:
     """
     Generates a normalized URL slug for MyWhooshInfo from workout name:
     e.g. 'Spiked Aerobic #1' -> 'spiked-aerobic-1', 'Into the Red!' -> 'into-the-red'
+    Returns empty string for generic or default activity names.
     """
     if not workout_name:
         return ""
-    slug = workout_name.lower()
+    cleaned = clean_extracted_name(workout_name)
+    if not cleaned or cleaned.lower().startswith("mywhoosh "):
+        return ""
+    slug = cleaned.lower()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     return slug.strip("-")
 
 
 def get_mywhooshinfo_url(workout_name: str) -> str:
     """
-    Constructs the MyWhooshInfo workout details URL.
+    Constructs the MyWhooshInfo workout details URL. Returns empty string if not a specific workout.
     """
     slug = generate_workout_slug(workout_name)
     if not slug:
@@ -618,10 +632,12 @@ def process_and_spoof_fit_file(
     # Extract Ride Start Date & Workout Title
     ride_dt = extract_fit_timestamp(fit_file, fallback_mtime=input_fit_path.stat().st_mtime)
     ride_date_str = ride_dt.strftime("%Y-%m-%d %H:%M:%S")
-    workout_title = extract_workout_name(fit_file, input_fit_path.stem, ride_date_str)
-    mywhooshinfo_url = get_mywhooshinfo_url(workout_title)
+    workout_title, is_workout = extract_workout_name(
+        fit_file, input_fit_path.stem, ride_date_str, sport_name=sport_name
+    )
+    mywhooshinfo_url = get_mywhooshinfo_url(workout_title) if is_workout else ""
 
-    logger.info(f"Extracted Workout Title: '{workout_title}' | Slug URL: {mywhooshinfo_url}")
+    logger.info(f"Extracted Activity Title: '{workout_title}' | Slug URL: {mywhooshinfo_url or 'N/A'}")
 
     builder = FitFileBuilder()
 
@@ -1019,9 +1035,14 @@ def update_garmin_activity_metadata(
     """
     Updates the Garmin activity title and description with workout details & Coggan metrics.
     """
-    lines = [f"Workout: {workout_name}"]
-    if append_url and slug:
-        lines.append(f"Details: https://mywhooshinfo.com/workouts/workout/{slug}")
+    lines = []
+    if slug:
+        lines.append(f"Workout: {workout_name}")
+        if append_url:
+            lines.append(f"Details: https://mywhooshinfo.com/workouts/workout/{slug}")
+    else:
+        lines.append(f"Activity: {workout_name}")
+
     lines.append(f"Metrics: NP: {np_val}W | IF: {if_val} | TSS: {tss_val} | Work: {work_kj}kJ")
     description = "\n".join(lines)
 
