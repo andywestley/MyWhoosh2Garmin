@@ -252,6 +252,156 @@ def clean_extracted_name(name: Any) -> Optional[str]:
     return val
 
 
+_WORKOUT_CATALOG_CACHE: Optional[List[Dict[str, Any]]] = None
+
+
+def find_mywhoosh_cache_dirs() -> List[Path]:
+    """
+    Discovers potential MyWhoosh persistent cache / workout directories
+    across Windows Store, standard Windows installs, and macOS.
+    """
+    dirs: List[Path] = []
+    # 1. Custom path override if configured
+    if ENV_WORKOUTS_DIR:
+        custom = Path(ENV_WORKOUTS_DIR).expanduser().resolve()
+        for parent in (custom, custom.parent, custom.parent.parent):
+            cache_p = parent / "PersistentDownloadDir" / "DefaultCache"
+            if cache_p.is_dir() and cache_p not in dirs:
+                dirs.append(cache_p)
+
+    # 2. Windows Path Discovery
+    if os.name == "nt":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            base_local = Path(local_app_data)
+            # Standard MyWhoosh installs
+            for std in ("MyWhoosh", "MyWhooshHD"):
+                p = base_local / std / "Saved" / "PersistentDownloadDir" / "DefaultCache"
+                if p.is_dir() and p not in dirs:
+                    dirs.append(p)
+            # Windows Store Packages
+            packages_path = base_local / "Packages"
+            if packages_path.is_dir():
+                try:
+                    for pkg in packages_path.iterdir():
+                        if pkg.is_dir() and pkg.name.startswith(MYWHOOSH_PREFIX_WINDOWS):
+                            p = (
+                                pkg
+                                / "LocalCache"
+                                / "Local"
+                                / "MyWhoosh"
+                                / "Saved"
+                                / "PersistentDownloadDir"
+                                / "DefaultCache"
+                            )
+                            if p.is_dir() and p not in dirs:
+                                dirs.append(p)
+                except Exception:
+                    pass
+
+    # 3. macOS Discovery
+    elif os.name == "posix":
+        mac_paths = [
+            Path.home()
+            / "Library"
+            / "Containers"
+            / "com.whoosh.whooshgame"
+            / "Data"
+            / "Library"
+            / "Application Support"
+            / "Epic"
+            / "MyWhoosh"
+            / "Saved"
+            / "PersistentDownloadDir"
+            / "DefaultCache",
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "MyWhoosh"
+            / "Saved"
+            / "PersistentDownloadDir"
+            / "DefaultCache",
+        ]
+        for mp in mac_paths:
+            if mp.is_dir() and mp not in dirs:
+                dirs.append(mp)
+
+    return dirs
+
+
+def load_mywhoosh_workout_catalog() -> List[Dict[str, Any]]:
+    """
+    Loads and caches structured workout definitions from MyWhoosh's local JSON library.
+    Each entry contains: 'id', 'name', 'durations' (list of step times in seconds), and 'file'.
+    """
+    global _WORKOUT_CATALOG_CACHE
+    if _WORKOUT_CATALOG_CACHE is not None:
+        return _WORKOUT_CATALOG_CACHE
+
+    catalog: List[Dict[str, Any]] = []
+    cache_dirs = find_mywhoosh_cache_dirs()
+    for cache_dir in cache_dirs:
+        for json_file in cache_dir.rglob("*.json"):
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and "Name" in data and "WorkoutStepsArray" in data:
+                        w_id = data.get("ID")
+                        w_name = str(data["Name"]).strip()
+                        durations = [
+                            int(round(s.get("Time", 0)))
+                            for s in data.get("WorkoutStepsArray", [])
+                        ]
+                        if durations and w_name:
+                            catalog.append(
+                                {
+                                    "id": w_id,
+                                    "name": w_name,
+                                    "durations": durations,
+                                    "file": json_file.name,
+                                }
+                            )
+            except Exception:
+                pass
+
+    logger.info(f"Loaded {len(catalog)} workout definitions from local MyWhoosh catalog.")
+    _WORKOUT_CATALOG_CACHE = catalog
+    return _WORKOUT_CATALOG_CACHE
+
+
+def match_workout_from_laps(lap_durations: List[int]) -> Optional[Tuple[str, str]]:
+    """
+    Matches a sequence of FIT lap durations against the local MyWhoosh workout library.
+    Returns (workout_name, match_type) or None.
+    """
+    if not lap_durations or len(lap_durations) < 2:
+        return None
+
+    catalog = load_mywhoosh_workout_catalog()
+    if not catalog:
+        return None
+
+    # 1. Exact step duration sequence match (100% confidence)
+    for wkt in catalog:
+        if wkt["durations"] == lap_durations:
+            return wkt["name"], "exact"
+
+    # 2. Fuzzy tolerance match (+/- 2s per step)
+    for wkt in catalog:
+        if len(wkt["durations"]) == len(lap_durations):
+            if all(abs(a - b) <= 2 for a, b in zip(lap_durations, wkt["durations"])):
+                return wkt["name"], "fuzzy"
+
+    # 3. Prefix match (if athlete completed at least 3 steps but ended early)
+    if len(lap_durations) >= 3:
+        for wkt in catalog:
+            if len(wkt["durations"]) > len(lap_durations):
+                if wkt["durations"][: len(lap_durations)] == lap_durations:
+                    return wkt["name"], "prefix"
+
+    return None
+
+
 def extract_workout_name(
     fit_file: FitFile, fallback_stem: str, ride_date_str: str, sport_name: str = "Cycling"
 ) -> Tuple[str, bool]:
@@ -261,7 +411,8 @@ def extract_workout_name(
     2. General message field scan for wkt_name / workout_name / workout_title / program_name
     3. SessionMessage.sport_profile_name (ignoring SessionMessage.name which is library 'session')
     4. CourseMessage.name (if non-generic)
-    5. Fallback from clean filename stem or formatted date string
+    5. Lap duration profile match against local MyWhoosh structured workout catalog
+    6. Fallback from clean filename stem or formatted date string
 
     Returns:
         (workout_title: str, is_specific_workout: bool)
@@ -301,7 +452,23 @@ def extract_workout_name(
             if c_name:
                 return c_name, False
 
-    # 5. Fallback from filename stem or date
+    # 5. Match workout from FIT Lap duration profile against local MyWhoosh workout library
+    laps = [r.message for r in fit_file.records if isinstance(r.message, LapMessage)]
+    lap_durations = [
+        int(round(getattr(lap, "total_timer_time", 0) or 0))
+        for lap in laps
+        if getattr(lap, "total_timer_time", 0)
+    ]
+    matched = match_workout_from_laps(lap_durations)
+    if matched:
+        matched_name, match_type = matched
+        logger.info(
+            f"Identified MyWhoosh workout '{matched_name}' "
+            f"({match_type} lap profile match across {len(lap_durations)} steps)."
+        )
+        return matched_name, True
+
+    # 6. Fallback from filename stem or date
     if fallback_stem:
         cleaned_stem = clean_extracted_name(re.sub(r"[-_]+", " ", fallback_stem).strip())
         if cleaned_stem and not re.match(r"^\d{4}[-_ ]\d{2}[-_ ]\d{2}", cleaned_stem):
@@ -313,7 +480,7 @@ def extract_workout_name(
 def generate_workout_slug(workout_name: str) -> str:
     """
     Generates a normalized URL slug for MyWhooshInfo from workout name:
-    e.g. 'Spiked Aerobic #1' -> 'spiked-aerobic-1', 'Into the Red!' -> 'into-the-red'
+    e.g. 'Speed Sprints' -> 'speed-sprints', 'Endurance with 30/30\'s' -> 'endurance-with-30-30-s'
     Returns empty string for generic or default activity names.
     """
     if not workout_name:
