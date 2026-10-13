@@ -331,7 +331,9 @@ def find_mywhoosh_cache_dirs() -> List[Path]:
 
 def load_mywhoosh_workout_catalog() -> List[Dict[str, Any]]:
     """
-    Loads and caches structured workout definitions from MyWhoosh's local JSON library.
+    Loads structured workout definitions:
+    1. Loads bundled workouts_catalog.json from SCRIPT_DIR if present (immediate offline/cross-platform fallback).
+    2. Merges any additional definitions found in MyWhoosh's local cache directories.
     Each entry contains: 'id', 'name', 'durations' (list of step times in seconds), and 'file'.
     """
     global _WORKOUT_CATALOG_CACHE
@@ -339,7 +341,27 @@ def load_mywhoosh_workout_catalog() -> List[Dict[str, Any]]:
         return _WORKOUT_CATALOG_CACHE
 
     catalog: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    # 1. Bundled catalog (provides 730+ workouts out-of-the-box on any OS without path dependencies)
+    bundled_file = SCRIPT_DIR / "workouts_catalog.json"
+    if bundled_file.exists():
+        try:
+            with open(bundled_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and "name" in item and "durations" in item:
+                            catalog.append(item)
+                            if item.get("id"):
+                                seen_ids.add(item["id"])
+            logger.info(f"Loaded {len(catalog)} workout definitions from bundled workouts_catalog.json.")
+        except Exception as e:
+            logger.warning(f"Error reading bundled workout catalog '{bundled_file.name}': {e}")
+
+    # 2. Local cache directory discovery (to pick up newly downloaded workouts from MyWhoosh)
     cache_dirs = find_mywhoosh_cache_dirs()
+    new_from_cache = 0
     for cache_dir in cache_dirs:
         for json_file in cache_dir.rglob("*.json"):
             try:
@@ -347,6 +369,8 @@ def load_mywhoosh_workout_catalog() -> List[Dict[str, Any]]:
                     data = json.load(f)
                     if isinstance(data, dict) and "Name" in data and "WorkoutStepsArray" in data:
                         w_id = data.get("ID")
+                        if w_id and w_id in seen_ids:
+                            continue
                         w_name = str(data["Name"]).strip()
                         durations = [
                             int(round(s.get("Time", 0)))
@@ -361,12 +385,19 @@ def load_mywhoosh_workout_catalog() -> List[Dict[str, Any]]:
                                     "file": json_file.name,
                                 }
                             )
+                            if w_id:
+                                seen_ids.add(w_id)
+                            new_from_cache += 1
             except Exception:
                 pass
 
-    logger.info(f"Loaded {len(catalog)} workout definitions from local MyWhoosh catalog.")
+    if new_from_cache > 0:
+        logger.info(f"Discovered {new_from_cache} additional workout definition(s) from local MyWhoosh cache.")
+
+    logger.info(f"Total active workout definitions in catalog: {len(catalog)}.")
     _WORKOUT_CATALOG_CACHE = catalog
     return _WORKOUT_CATALOG_CACHE
+
 
 
 def match_workout_from_laps(lap_durations: List[int]) -> Optional[Tuple[str, str]]:
@@ -1616,9 +1647,37 @@ def get_pending_fit_files(workout_dir: Path, archive_dir: Path) -> List[Path]:
     return candidate_files
 
 
+def auto_update_script_repo() -> None:
+    """
+    Attempts a quick 'git pull --ff-only' in SCRIPT_DIR so that improvements,
+    catalog updates, and bug fixes pushed to GitHub are automatically applied
+    on client machines (such as macOS background runners) without manual intervention.
+    """
+    if not (SCRIPT_DIR / ".git").exists():
+        return
+    try:
+        res = subprocess.run(
+            ["git", "pull", "--ff-only"],
+            cwd=str(SCRIPT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if res.returncode == 0:
+            out = res.stdout.strip()
+            if out and "Already up to date" not in out:
+                logger.info(f"Self-update: pulled latest changes from remote repository ({out}).")
+    except Exception as e:
+        logger.debug(f"Self-update skipped: {e}")
+
+
 def main():
     """Main execution entry point."""
     logger.info("=== Starting MyWhoosh2Garmin Sync ===")
+
+    # 0. Check for remote script updates
+    auto_update_script_repo()
 
     # 1. Discover Workout Path
     workout_dir = get_fitfile_location()
