@@ -402,7 +402,14 @@ def load_mywhoosh_workout_catalog() -> List[Dict[str, Any]]:
 
 def match_workout_from_laps(lap_durations: List[int]) -> Optional[Tuple[str, str]]:
     """
-    Matches a sequence of FIT lap durations against the local MyWhoosh workout library.
+    Matches a sequence of FIT lap durations against the MyWhoosh workout library.
+    Handles:
+    1. Exact full workout match
+    2. Fuzzy full workout match (+/- 2s per step)
+    3. Workout completed followed by post-workout free-ride extension (extra laps at end)
+    4. Workout with prolonged final cooldown step (last step extended by athlete)
+    5. Workout preceded by free-ride warm-up (contiguous sub-sequence)
+    6. Workout ended early (athlete completed >= 3 steps)
     Returns (workout_name, match_type) or None.
     """
     if not lap_durations or len(lap_durations) < 2:
@@ -412,23 +419,71 @@ def match_workout_from_laps(lap_durations: List[int]) -> Optional[Tuple[str, str
     if not catalog:
         return None
 
-    # 1. Exact step duration sequence match (100% confidence)
+    # Priority 1: Exact complete match across all laps
     for wkt in catalog:
         if wkt["durations"] == lap_durations:
             return wkt["name"], "exact"
 
-    # 2. Fuzzy tolerance match (+/- 2s per step)
+    # Priority 2: Fuzzy complete match (+/- 2s per step) across all laps
     for wkt in catalog:
         if len(wkt["durations"]) == len(lap_durations):
             if all(abs(a - b) <= 2 for a, b in zip(lap_durations, wkt["durations"])):
                 return wkt["name"], "fuzzy"
 
-    # 3. Prefix match (if athlete completed at least 3 steps but ended early)
+    # Priority 3: Completed workout followed by free-ride extension (laps start with full workout)
+    # Picks the longest matching workout profile (e.g. 12 steps before free-ride)
+    prefix_matches = []
+    for wkt in catalog:
+        w_durs = wkt["durations"]
+        n = len(w_durs)
+        if 2 <= n < len(lap_durations):
+            if lap_durations[:n] == w_durs:
+                prefix_matches.append((wkt["name"], "completed_plus_freeride", n))
+            elif all(abs(a - b) <= 2 for a, b in zip(lap_durations[:n], w_durs)):
+                prefix_matches.append((wkt["name"], "fuzzy_completed_plus_freeride", n))
+    if prefix_matches:
+        prefix_matches.sort(key=lambda x: x[2], reverse=True)
+        return prefix_matches[0][0], prefix_matches[0][1]
+
+    # Priority 4: Final cooldown step prolonged (steps 1..N-1 match, final step extended by athlete)
+    cooldown_ext_matches = []
+    for wkt in catalog:
+        w_durs = wkt["durations"]
+        n = len(w_durs)
+        if n >= 3 and len(lap_durations) == n:
+            if lap_durations[: n - 1] == w_durs[: n - 1] and lap_durations[n - 1] >= w_durs[n - 1]:
+                cooldown_ext_matches.append((wkt["name"], "extended_cooldown", n))
+    if cooldown_ext_matches:
+        cooldown_ext_matches.sort(key=lambda x: x[2], reverse=True)
+        return cooldown_ext_matches[0][0], cooldown_ext_matches[0][1]
+
+    # Priority 5: Free-ride warm-up before workout (contiguous sub-sequence)
+    subseq_matches = []
+    for wkt in catalog:
+        w_durs = wkt["durations"]
+        n = len(w_durs)
+        if n >= 3 and len(lap_durations) > n:
+            for start in range(1, len(lap_durations) - n + 1):
+                window = lap_durations[start : start + n]
+                if window == w_durs:
+                    subseq_matches.append((wkt["name"], f"subsequence_offset_{start}", n))
+                    break
+                elif all(abs(a - b) <= 2 for a, b in zip(window, w_durs)):
+                    subseq_matches.append((wkt["name"], f"fuzzy_subsequence_offset_{start}", n))
+                    break
+    if subseq_matches:
+        subseq_matches.sort(key=lambda x: x[2], reverse=True)
+        return subseq_matches[0][0], subseq_matches[0][1]
+
+    # Priority 6: Athlete cut workout short (at least 3 steps completed)
     if len(lap_durations) >= 3:
         for wkt in catalog:
-            if len(wkt["durations"]) > len(lap_durations):
-                if wkt["durations"][: len(lap_durations)] == lap_durations:
-                    return wkt["name"], "prefix"
+            w_durs = wkt["durations"]
+            if len(w_durs) > len(lap_durations):
+                if w_durs[: len(lap_durations)] == lap_durations:
+                    return wkt["name"], "early_exit"
+                elif all(abs(a - b) <= 2 for a, b in zip(lap_durations, w_durs[: len(lap_durations)])):
+                    return wkt["name"], "fuzzy_early_exit"
 
     return None
 
