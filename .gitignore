@@ -1,6 +1,7 @@
 .garth/*
 *.log
 *.json
+!workouts_catalog.json
 *.lock
 .env
 __pycache__/
