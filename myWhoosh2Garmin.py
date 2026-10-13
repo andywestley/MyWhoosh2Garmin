@@ -1856,5 +1856,76 @@ def main():
     logger.info(f"=== Sync Completed: {success_count} file(s) synced and archived. ===")
 
 
+def fix_recent_activity(target_activity_id: Optional[int] = None) -> bool:
+    """
+    Directly enriches an existing Garmin Connect activity with workout title & MyWhooshInfo details.
+    Defaults to today's activity 24705575099 or the latest ride from the catalog.
+    """
+    act_id = target_activity_id or 24705575099
+    name = "Endurance into Max Aerobic"
+    slug = "endurance-into-max-aerobic"
+    np_p = 144
+    if_val = 0.96
+    tss = 95.1
+    work = 482
+
+    # If GIT_BACKUP_REPO_PATH is available, try reading entry from rides_index.json
+    if GIT_BACKUP_REPO_PATH:
+        j_path = Path(GIT_BACKUP_REPO_PATH).expanduser().resolve() / "rides_index.json"
+        if j_path.exists():
+            try:
+                with open(j_path, "r", encoding="utf-8") as f:
+                    entries = json.load(f)
+                    if isinstance(entries, list) and entries:
+                        match = None
+                        if target_activity_id:
+                            for e in entries:
+                                if str(e.get("ActivityID")) == str(target_activity_id):
+                                    match = e
+                                    break
+                        if not match:
+                            match = entries[-1]
+                        if match:
+                            act_id = int(match.get("ActivityID", act_id))
+                            name = match.get("Workout Name", name)
+                            slug = generate_workout_slug(name)
+                            np_p = match.get("NP (W)", np_p) or np_p
+                            if_val = match.get("IF", if_val) or if_val
+                            tss = match.get("TSS", tss) or tss
+                            work = match.get("Work (kJ)", work) or work
+            except Exception as e:
+                logger.debug(f"Could not load rides_index.json: {e}")
+
+    logger.info(f"Connecting to Garmin to update activity {act_id} ('{name}')...")
+    if not authenticate_to_garmin():
+        logger.error("Authentication to Garmin Connect failed.")
+        return False
+
+    success = update_garmin_activity_metadata(
+        activity_id=act_id,
+        workout_name=name,
+        slug=slug,
+        np_val=np_p,
+        if_val=if_val,
+        tss_val=tss,
+        work_kj=work,
+        append_url=APPEND_MYWHOOSHINFO_URL,
+    )
+    if success:
+        print(f"\n[SUCCESS] Garmin activity {act_id} has been updated:")
+        print(f"  Title: {name}")
+        print(f"  Notes: Workout: {name}")
+        print(f"         Details: https://mywhooshinfo.com/workouts/workout/{slug}")
+        print(f"         Metrics: NP: {np_p}W | IF: {if_val} | TSS: {tss} | Work: {work}kJ\n")
+    return success
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] in ("--fix-today", "--fix-latest", "--update-activity"):
+        act_id = None
+        if len(sys.argv) > 2 and sys.argv[2].isdigit():
+            act_id = int(sys.argv[2])
+        fix_recent_activity(act_id)
+    else:
+        main()
+
