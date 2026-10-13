@@ -578,8 +578,6 @@ def get_fitfile_location() -> Optional[Path]:
                 base_local / "MyWhoosh" / "Saved" / "Workouts",
                 base_local / "MyWhooshHD" / "Saved" / "Workouts",
                 base_local / "MyWhoosh" / "Content" / "Data",
-                Path.home() / "Documents" / "MyWhoosh" / "Saved" / "Workouts",
-                Path.home() / "Saved Games" / "MyWhoosh",
             ]
 
             for candidate in standard_candidates:
@@ -596,9 +594,6 @@ def get_fitfile_location() -> Optional[Path]:
                             store_candidates = [
                                 directory / "LocalCache" / "Local" / "MyWhoosh" / "Saved" / "Workouts",
                                 directory / "LocalCache" / "Local" / "MyWhoosh" / "Content" / "Data",
-                                directory / "LocalCache" / "Local" / "MyWhoosh" / "Saved",
-                                directory / "LocalCache" / "Local" / "com.mywhoosh.whooshgame",
-                                directory / "LocalState" / "MyWhoosh",
                             ]
                             for s_cand in store_candidates:
                                 if s_cand.is_dir():
@@ -614,7 +609,7 @@ def get_fitfile_location() -> Optional[Path]:
 
     # 3. POSIX Path Discovery (macOS / Linux)
     elif os.name == "posix":
-        mac_candidates = [
+        mac_path = (
             Path.home()
             / "Library"
             / "Containers"
@@ -625,36 +620,11 @@ def get_fitfile_location() -> Optional[Path]:
             / "Epic"
             / "MyWhoosh"
             / "Content"
-            / "Data",
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "Epic"
-            / "MyWhoosh"
-            / "Content"
-            / "Data",
-            Path.home()
-            / "Library"
-            / "Containers"
-            / "com.whoosh.whooshgame"
             / "Data"
-            / "Library"
-            / "Application Support"
-            / "MyWhoosh"
-            / "Saved"
-            / "Workouts",
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "MyWhoosh"
-            / "Saved"
-            / "Workouts",
-            Path.home() / "Documents" / "MyWhoosh",
-        ]
-        for mac_path in mac_candidates:
-            if mac_path.is_dir():
-                logger.info(f"Discovered MyWhoosh macOS path: {mac_path}")
-                return mac_path
+        )
+        if mac_path.is_dir():
+            logger.info(f"Discovered MyWhoosh macOS path: {mac_path}")
+            return mac_path
 
     logger.error("Could not automatically locate MyWhoosh workout directory. Set MYWHOOSH_WORKOUTS_DIR in .env.")
     return None
@@ -1604,9 +1574,12 @@ def backup_and_index_ride(
     repo_path_str: str,
     subdir_str: str,
     auto_push: bool = True,
+    original_fit_path: Optional[Path] = None,
 ) -> bool:
     """
-    Copies FIT file to structured year/month folder in the backup repo, updates catalog, and commits.
+    Copies FIT file to structured year/month folder in the backup repo,
+    optionally preserves the raw original MyWhoosh extract in 'raw/',
+    updates catalog, and commits.
     """
     if not repo_path_str:
         logger.warning("Git ride backup skipped: GIT_BACKUP_REPO_PATH is not configured.")
@@ -1640,6 +1613,23 @@ def backup_and_index_ride(
     except Exception as e:
         logger.warning(f"Failed to copy FIT file to backup directory '{target_dir}': {e}")
         return False
+
+    # Also back up the untouched original MyWhoosh extract to raw/{sport}/{year}/{month}/
+    if original_fit_path and original_fit_path.exists() and original_fit_path != source_fit_path:
+        try:
+            raw_target_dir = repo_path / "raw"
+            if subdir_str and subdir_str.lower() == "auto":
+                raw_target_dir = raw_target_dir / telemetry.sport.lower()
+            elif subdir_str:
+                raw_target_dir = raw_target_dir / subdir_str
+            raw_target_dir = raw_target_dir / telemetry.year / telemetry.month
+            raw_target_dir.mkdir(parents=True, exist_ok=True)
+            dest_raw = raw_target_dir / original_fit_path.name
+            shutil.copy2(str(original_fit_path), str(dest_raw))
+            logger.info(f"Backed up raw untouched MyWhoosh extract to '{dest_raw}'.")
+        except Exception as e:
+            logger.warning(f"Failed to copy raw original FIT file to backup directory: {e}")
+
 
     # Update rides_summary.csv and rides_index.json
     try:
@@ -1784,6 +1774,7 @@ def main():
                             repo_path_str=GIT_BACKUP_REPO_PATH,
                             subdir_str=GIT_BACKUP_SUBDIR,
                             auto_push=GIT_AUTO_PUSH,
+                            original_fit_path=fit_path,
                         )
                     else:
                         logger.warning("GitHub backup is enabled (ENABLE_GIT_BACKUP=true), but GIT_BACKUP_REPO_PATH is empty in .env. Skipping Git backup.")
