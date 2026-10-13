@@ -578,6 +578,8 @@ def get_fitfile_location() -> Optional[Path]:
                 base_local / "MyWhoosh" / "Saved" / "Workouts",
                 base_local / "MyWhooshHD" / "Saved" / "Workouts",
                 base_local / "MyWhoosh" / "Content" / "Data",
+                Path.home() / "Documents" / "MyWhoosh" / "Saved" / "Workouts",
+                Path.home() / "Saved Games" / "MyWhoosh",
             ]
 
             for candidate in standard_candidates:
@@ -594,6 +596,9 @@ def get_fitfile_location() -> Optional[Path]:
                             store_candidates = [
                                 directory / "LocalCache" / "Local" / "MyWhoosh" / "Saved" / "Workouts",
                                 directory / "LocalCache" / "Local" / "MyWhoosh" / "Content" / "Data",
+                                directory / "LocalCache" / "Local" / "MyWhoosh" / "Saved",
+                                directory / "LocalCache" / "Local" / "com.mywhoosh.whooshgame",
+                                directory / "LocalState" / "MyWhoosh",
                             ]
                             for s_cand in store_candidates:
                                 if s_cand.is_dir():
@@ -609,7 +614,7 @@ def get_fitfile_location() -> Optional[Path]:
 
     # 3. POSIX Path Discovery (macOS / Linux)
     elif os.name == "posix":
-        mac_path = (
+        mac_candidates = [
             Path.home()
             / "Library"
             / "Containers"
@@ -620,11 +625,36 @@ def get_fitfile_location() -> Optional[Path]:
             / "Epic"
             / "MyWhoosh"
             / "Content"
+            / "Data",
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Epic"
+            / "MyWhoosh"
+            / "Content"
+            / "Data",
+            Path.home()
+            / "Library"
+            / "Containers"
+            / "com.whoosh.whooshgame"
             / "Data"
-        )
-        if mac_path.is_dir():
-            logger.info(f"Discovered MyWhoosh macOS path: {mac_path}")
-            return mac_path
+            / "Library"
+            / "Application Support"
+            / "MyWhoosh"
+            / "Saved"
+            / "Workouts",
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "MyWhoosh"
+            / "Saved"
+            / "Workouts",
+            Path.home() / "Documents" / "MyWhoosh",
+        ]
+        for mac_path in mac_candidates:
+            if mac_path.is_dir():
+                logger.info(f"Discovered MyWhoosh macOS path: {mac_path}")
+                return mac_path
 
     logger.error("Could not automatically locate MyWhoosh workout directory. Set MYWHOOSH_WORKOUTS_DIR in .env.")
     return None
