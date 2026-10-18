@@ -227,9 +227,9 @@ def calculate_lake_bled_position(
     """
     Computes georeferenced (lat, lon) coordinates on Lake Bled (Slovenia) along the 
     MyWhoosh 10km lozenge (stadium) circuit based on accumulated distance.
-    Starts at the southern channel (46.3606° N, 14.0905° E) south-southeast of Bled Island,
+    Starts at the southern channel (46.3608° N, 14.0905° E) south-southeast of Bled Island,
     runs in a straight line North-East along the channel towards the eastern bay,
-    sweeps around the eastern bay near Bled town, runs in a straight line Westbound
+    sweeps around the eastern bay in open water, runs in a straight line Westbound
     along the northern shore under the castle cliffs, and sweeps around Bled Island
     back to the start.
     """
@@ -238,44 +238,51 @@ def calculate_lake_bled_position(
     # Normalized fraction of full lap (0.0 to 1.0)
     frac = (distance_m % circuit_length_m) / circuit_length_m
 
-    # Key landmark coordinates defining the lozenge on Lake Bled
-    east_turn_lat = 46.3645
-    east_turn_lon = 14.1065
-    north_straight_lat = 46.3680
-    north_straight_lon = 14.0905
-    west_turn_lat = 46.3643
-    west_turn_lon = 14.0840
+    # Key landmark coordinates defining the lozenge on Lake Bled (100% in water)
+    south_end_lat = 46.3642
+    south_end_lon = 14.1015
 
-    # Seg 1 (0.00 to 0.38): Southern straightaway heading North-East
+    east_center_lat = 46.3660
+    east_center_lon = 14.1015
+    r_lat = 0.0018
+    r_lon = 0.0028
+
+    north_start_lat = 46.3678
+    north_start_lon = 14.1015
+
+    north_end_lat = 46.3665
+    north_end_lon = 14.0875
+
+    west_center_lat = 46.3636
+    west_center_lon = 14.0875
+    w_r_lat = 0.0028
+    w_r_lon = 0.0035
+
+    # Seg 1 (0.00 to 0.38): Southern straightaway heading North-East (start -> south_end)
     if frac < 0.38:
         t = frac / 0.38
-        lat = start_lat + t * (east_turn_lat - 0.0020 - start_lat)
-        lon = start_lon + t * (east_turn_lon - start_lon)
-    # Seg 2 (0.38 to 0.50): Eastern turn looping 180° counter-clockwise by Bled town
+        lat = start_lat + t * (south_end_lat - start_lat)
+        lon = start_lon + t * (south_end_lon - start_lon)
+    # Seg 2 (0.38 to 0.50): Eastern turn in open water (sweeps 180° counter-clockwise to north_start)
     elif frac < 0.50:
         t = (frac - 0.38) / 0.12
         angle = -math.pi / 2.0 + t * math.pi
-        r_lat = 0.0025
-        r_lon = 0.0035
-        lat = east_turn_lat + r_lat * math.sin(angle)
-        lon = east_turn_lon + r_lon * math.cos(angle)
-    # Seg 3 (0.50 to 0.88): Northern straightaway heading Westbound under castle
+        lat = east_center_lat + r_lat * math.sin(angle)
+        lon = east_center_lon + r_lon * math.cos(angle)
+    # Seg 3 (0.50 to 0.88): Northern straightaway heading Westbound under castle (north_start -> north_end)
     elif frac < 0.88:
         t = (frac - 0.50) / 0.38
-        east_north_lat = east_turn_lat + 0.0025
-        east_north_lon = east_turn_lon
-        lat = east_north_lat + t * (north_straight_lat - east_north_lat)
-        lon = east_north_lon + t * (west_turn_lon + 0.0050 - east_north_lon)
-    # Seg 4 (0.88 to 1.00): Western turn looping 180° counter-clockwise around Bled Island
+        lat = north_start_lat + t * (north_end_lat - north_start_lat)
+        lon = north_start_lon + t * (north_end_lon - north_start_lon)
+    # Seg 4 (0.88 to 1.00): Western turn looping 180° counter-clockwise around Bled Island back to start
     else:
         t = (frac - 0.88) / 0.12
         angle = math.pi / 2.0 + t * math.pi
-        r_lat = 0.0037
-        r_lon = 0.0040
-        lat = west_turn_lat + r_lat * math.sin(angle)
-        lon = west_turn_lon + r_lon * math.cos(angle)
+        lat = west_center_lat + w_r_lat * math.sin(angle)
+        lon = west_center_lon + w_r_lon * math.cos(angle)
 
     return round(lat, 7), round(lon, 7)
+
 
 
 
