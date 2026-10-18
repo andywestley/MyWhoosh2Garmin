@@ -200,6 +200,51 @@ GIT_BACKUP_REPO_PATH = _get_env_clean("GIT_BACKUP_REPO_PATH")
 GIT_BACKUP_SUBDIR = _get_env_clean("GIT_BACKUP_SUBDIR", default="auto")
 GIT_AUTO_PUSH = _get_bool_env("GIT_AUTO_PUSH", default=True)
 
+# Virtual Rowing Georeferencing (Lake Bled, Slovenia)
+ROWING_GEOREFERENCE_ENABLED = _get_bool_env("ROWING_GEOREFERENCE_ENABLED", default=True)
+try:
+    LAKE_BLED_START_LAT = float(_get_env_clean("LAKE_BLED_START_LAT", "46.3612") or 46.3612)
+except ValueError:
+    LAKE_BLED_START_LAT = 46.3612
+
+try:
+    LAKE_BLED_START_LON = float(_get_env_clean("LAKE_BLED_START_LON", "14.0938") or 14.0938)
+except ValueError:
+    LAKE_BLED_START_LON = 14.0938
+
+try:
+    LAKE_BLED_CIRCUIT_METERS = float(_get_env_clean("LAKE_BLED_CIRCUIT_METERS", "5000.0") or 5000.0)
+except ValueError:
+    LAKE_BLED_CIRCUIT_METERS = 5000.0
+
+
+def calculate_lake_bled_position(
+    distance_m: float,
+    circuit_length_m: float = LAKE_BLED_CIRCUIT_METERS,
+    start_lat: float = LAKE_BLED_START_LAT,
+    start_lon: float = LAKE_BLED_START_LON,
+) -> Tuple[float, float]:
+    """
+    Computes georeferenced (lat, lon) coordinates on Lake Bled (Slovenia) along the 
+    MyWhoosh 10km circuit course based on accumulated distance.
+    Starts at the southern channel (46.3612° N, 14.0938° E) south-southeast of Bled Island,
+    sweeps East towards Bled town, loops North under the castle cliffs, West towards 
+    Velika Zaka / Mala Zaka, and loops around the island back to the start.
+    """
+
+    import math
+    frac = (distance_m % circuit_length_m) / circuit_length_m
+    theta = 2.0 * math.pi * frac - (math.pi / 2.0)
+    a_lon = 0.0115  # East-West semi-axis (~880m)
+    b_lat = 0.0028  # North-South semi-axis (~310m)
+    # At theta = -pi/2 (d=0), sin(theta) = -1, so lat = center_lat - b_lat = start_lat
+    center_lat = start_lat + b_lat
+    center_lon = start_lon
+    lat = center_lat + b_lat * math.sin(theta)
+    lon = center_lon + a_lon * math.cos(theta)
+    return round(lat, 7), round(lon, 7)
+
+
 
 def extract_fit_sport(fit_file: FitFile) -> Tuple[str, str, int, str]:
     """
@@ -892,6 +937,22 @@ def process_and_spoof_fit_file(
 
     logger.info(f"Extracted Activity Title: '{workout_title}' | Slug URL: {mywhooshinfo_url or 'N/A'}")
 
+    # Check if raw FIT file already has valid real-world coordinates (outside Null Island)
+    raw_has_valid_gps = False
+    for r in fit_file.records:
+        if isinstance(r.message, RecordMessage):
+            lat = getattr(r.message, "position_lat", None)
+            lon = getattr(r.message, "position_long", None)
+            if lat is not None and lon is not None:
+                if abs(lat) > 2.0 or abs(lon) > 2.0:
+                    raw_has_valid_gps = True
+                    break
+
+    if sport_name == "Rowing" and ROWING_GEOREFERENCE_ENABLED and not raw_has_valid_gps:
+        logger.info(
+            f"Georeferencing rowing activity to Lake Bled, Slovenia (circuit start: {LAKE_BLED_START_LAT}°N, {LAKE_BLED_START_LON}°E)."
+        )
+
     builder = FitFileBuilder()
 
     # Lap-level and Session-level metric accumulators
@@ -902,6 +963,11 @@ def process_and_spoof_fit_file(
     session_cadence_values: List[int] = []
     session_power_values: List[int] = []
     session_heart_rate_values: List[int] = []
+
+    lap_start_pos: Optional[Tuple[float, float]] = None
+    lap_end_pos: Optional[Tuple[float, float]] = None
+    session_start_pos: Optional[Tuple[float, float]] = None
+    session_end_pos: Optional[Tuple[float, float]] = None
 
     total_distance_m = 0.0
     session_dur_val = 0
@@ -978,9 +1044,43 @@ def process_and_spoof_fit_file(
             if d_val is not None and float(d_val) > total_distance_m:
                 total_distance_m = float(d_val)
 
+            # Georeference Rowing activities if coordinates are missing or at Null Island
+            if sport_name == "Rowing" and ROWING_GEOREFERENCE_ENABLED and not raw_has_valid_gps:
+                cur_dist = float(d_val) if d_val is not None else total_distance_m
+                g_lat, g_lon = calculate_lake_bled_position(cur_dist)
+                try:
+                    message.position_lat = g_lat
+                    message.position_long = g_lon
+                except Exception as e:
+                    logger.debug(f"Could not set GPS coordinates on RecordMessage: {e}")
+
+            # Track GPS positions for Lap and Session headers
+            rec_lat = getattr(message, "position_lat", None)
+            rec_lon = getattr(message, "position_long", None)
+            if rec_lat is not None and rec_lon is not None:
+                if lap_start_pos is None:
+                    lap_start_pos = (rec_lat, rec_lon)
+                lap_end_pos = (rec_lat, rec_lon)
+                if session_start_pos is None:
+                    session_start_pos = (rec_lat, rec_lon)
+                session_end_pos = (rec_lat, rec_lon)
+
         # 5. Lap Message: Populate missing averages & power metrics
         elif isinstance(message, LapMessage):
             message = clone_message(message, LapMessage)
+            if lap_start_pos and lap_end_pos:
+                try:
+                    if not getattr(message, "start_position_lat", None):
+                        message.start_position_lat = lap_start_pos[0]
+                    if not getattr(message, "start_position_long", None):
+                        message.start_position_long = lap_start_pos[1]
+                    if not getattr(message, "end_position_lat", None):
+                        message.end_position_lat = lap_end_pos[0]
+                    if not getattr(message, "end_position_long", None):
+                        message.end_position_long = lap_end_pos[1]
+                except Exception:
+                    pass
+
             if lap_power_values:
                 try:
                     if not getattr(message, "avg_power", None):
@@ -1034,10 +1134,25 @@ def process_and_spoof_fit_file(
             lap_cadence_values = []
             lap_power_values = []
             lap_heart_rate_values = []
+            lap_start_pos = None
+            lap_end_pos = None
 
         # 6. Session Message: Populate missing averages, NP, IF, TSS, Work, and FTP
         elif isinstance(message, SessionMessage):
             message = clone_message(message, SessionMessage)
+            if session_start_pos and session_end_pos:
+                try:
+                    if not getattr(message, "start_position_lat", None):
+                        message.start_position_lat = session_start_pos[0]
+                    if not getattr(message, "start_position_long", None):
+                        message.start_position_long = session_start_pos[1]
+                    if not getattr(message, "end_position_lat", None):
+                        message.end_position_lat = session_end_pos[0]
+                    if not getattr(message, "end_position_long", None):
+                        message.end_position_long = session_end_pos[1]
+                except Exception:
+                    pass
+
             s_dist = getattr(message, "total_distance", None)
             if s_dist is not None:
                 total_distance_m = float(s_dist)
