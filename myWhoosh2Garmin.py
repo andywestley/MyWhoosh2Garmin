@@ -203,19 +203,19 @@ GIT_AUTO_PUSH = _get_bool_env("GIT_AUTO_PUSH", default=True)
 # Virtual Rowing Georeferencing (Lake Bled, Slovenia)
 ROWING_GEOREFERENCE_ENABLED = _get_bool_env("ROWING_GEOREFERENCE_ENABLED", default=True)
 try:
-    LAKE_BLED_START_LAT = float(_get_env_clean("LAKE_BLED_START_LAT", "46.3605") or 46.3605)
+    LAKE_BLED_START_LAT = float(_get_env_clean("LAKE_BLED_START_LAT", "46.3606") or 46.3606)
 except ValueError:
-    LAKE_BLED_START_LAT = 46.3605
+    LAKE_BLED_START_LAT = 46.3606
 
 try:
-    LAKE_BLED_START_LON = float(_get_env_clean("LAKE_BLED_START_LON", "14.0910") or 14.0910)
+    LAKE_BLED_START_LON = float(_get_env_clean("LAKE_BLED_START_LON", "14.0905") or 14.0905)
 except ValueError:
-    LAKE_BLED_START_LON = 14.0910
+    LAKE_BLED_START_LON = 14.0905
 
 try:
-    LAKE_BLED_CIRCUIT_METERS = float(_get_env_clean("LAKE_BLED_CIRCUIT_METERS", "5000.0") or 5000.0)
+    LAKE_BLED_CIRCUIT_METERS = float(_get_env_clean("LAKE_BLED_CIRCUIT_METERS", "9500.0") or 9500.0)
 except ValueError:
-    LAKE_BLED_CIRCUIT_METERS = 5000.0
+    LAKE_BLED_CIRCUIT_METERS = 9500.0
 
 
 def calculate_lake_bled_position(
@@ -226,24 +226,57 @@ def calculate_lake_bled_position(
 ) -> Tuple[float, float]:
     """
     Computes georeferenced (lat, lon) coordinates on Lake Bled (Slovenia) along the 
-    MyWhoosh 10km circuit course based on accumulated distance.
-    Starts at the southern channel (46.3605° N, 14.0910° E) south-southeast of Bled Island,
-    sweeps East towards Bled town, loops North under the castle cliffs, West towards 
-    Velika Zaka / Mala Zaka, and loops around the island back to the start.
+    MyWhoosh 10km lozenge (stadium) circuit based on accumulated distance.
+    Starts at the southern channel (46.3606° N, 14.0905° E) south-southeast of Bled Island,
+    runs in a straight line North-East along the channel towards the eastern bay,
+    sweeps around the eastern bay near Bled town, runs in a straight line Westbound
+    along the northern shore under the castle cliffs, and sweeps around Bled Island
+    back to the start.
     """
-
     import math
 
+    # Normalized fraction of full lap (0.0 to 1.0)
     frac = (distance_m % circuit_length_m) / circuit_length_m
-    theta = 2.0 * math.pi * frac - (math.pi / 2.0)
-    a_lon = 0.0115  # East-West semi-axis (~880m)
-    b_lat = 0.0028  # North-South semi-axis (~310m)
-    # At theta = -pi/2 (d=0), sin(theta) = -1, so lat = center_lat - b_lat = start_lat
-    center_lat = start_lat + b_lat
-    center_lon = start_lon
-    lat = center_lat + b_lat * math.sin(theta)
-    lon = center_lon + a_lon * math.cos(theta)
+
+    # Key landmark coordinates defining the lozenge on Lake Bled
+    east_turn_lat = 46.3645
+    east_turn_lon = 14.1065
+    north_straight_lat = 46.3680
+    north_straight_lon = 14.0905
+    west_turn_lat = 46.3643
+    west_turn_lon = 14.0840
+
+    # Seg 1 (0.00 to 0.38): Southern straightaway heading North-East
+    if frac < 0.38:
+        t = frac / 0.38
+        lat = start_lat + t * (east_turn_lat - 0.0020 - start_lat)
+        lon = start_lon + t * (east_turn_lon - start_lon)
+    # Seg 2 (0.38 to 0.50): Eastern turn looping 180° counter-clockwise by Bled town
+    elif frac < 0.50:
+        t = (frac - 0.38) / 0.12
+        angle = -math.pi / 2.0 + t * math.pi
+        r_lat = 0.0025
+        r_lon = 0.0035
+        lat = east_turn_lat + r_lat * math.sin(angle)
+        lon = east_turn_lon + r_lon * math.cos(angle)
+    # Seg 3 (0.50 to 0.88): Northern straightaway heading Westbound under castle
+    elif frac < 0.88:
+        t = (frac - 0.50) / 0.38
+        east_north_lat = east_turn_lat + 0.0025
+        east_north_lon = east_turn_lon
+        lat = east_north_lat + t * (north_straight_lat - east_north_lat)
+        lon = east_north_lon + t * (west_turn_lon + 0.0050 - east_north_lon)
+    # Seg 4 (0.88 to 1.00): Western turn looping 180° counter-clockwise around Bled Island
+    else:
+        t = (frac - 0.88) / 0.12
+        angle = math.pi / 2.0 + t * math.pi
+        r_lat = 0.0037
+        r_lon = 0.0040
+        lat = west_turn_lat + r_lat * math.sin(angle)
+        lon = west_turn_lon + r_lon * math.cos(angle)
+
     return round(lat, 7), round(lon, 7)
+
 
 
 
