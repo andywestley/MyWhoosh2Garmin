@@ -203,14 +203,14 @@ GIT_AUTO_PUSH = _get_bool_env("GIT_AUTO_PUSH", default=True)
 # Virtual Rowing Georeferencing (Lake Bled, Slovenia)
 ROWING_GEOREFERENCE_ENABLED = _get_bool_env("ROWING_GEOREFERENCE_ENABLED", default=True)
 try:
-    LAKE_BLED_START_LAT = float(_get_env_clean("LAKE_BLED_START_LAT", "46.3612") or 46.3612)
+    LAKE_BLED_START_LAT = float(_get_env_clean("LAKE_BLED_START_LAT", "46.3605") or 46.3605)
 except ValueError:
-    LAKE_BLED_START_LAT = 46.3612
+    LAKE_BLED_START_LAT = 46.3605
 
 try:
-    LAKE_BLED_START_LON = float(_get_env_clean("LAKE_BLED_START_LON", "14.0938") or 14.0938)
+    LAKE_BLED_START_LON = float(_get_env_clean("LAKE_BLED_START_LON", "14.0910") or 14.0910)
 except ValueError:
-    LAKE_BLED_START_LON = 14.0938
+    LAKE_BLED_START_LON = 14.0910
 
 try:
     LAKE_BLED_CIRCUIT_METERS = float(_get_env_clean("LAKE_BLED_CIRCUIT_METERS", "5000.0") or 5000.0)
@@ -227,12 +227,13 @@ def calculate_lake_bled_position(
     """
     Computes georeferenced (lat, lon) coordinates on Lake Bled (Slovenia) along the 
     MyWhoosh 10km circuit course based on accumulated distance.
-    Starts at the southern channel (46.3612° N, 14.0938° E) south-southeast of Bled Island,
+    Starts at the southern channel (46.3605° N, 14.0910° E) south-southeast of Bled Island,
     sweeps East towards Bled town, loops North under the castle cliffs, West towards 
     Velika Zaka / Mala Zaka, and loops around the island back to the start.
     """
 
     import math
+
     frac = (distance_m % circuit_length_m) / circuit_length_m
     theta = 2.0 * math.pi * frac - (math.pi / 2.0)
     a_lon = 0.0115  # East-West semi-axis (~880m)
