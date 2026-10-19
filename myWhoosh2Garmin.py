@@ -1334,16 +1334,18 @@ def process_and_spoof_fit_file(
     return True, telemetry
 
 
-def archive_file(source_file: Path, archive_dir: Path) -> Optional[Path]:
+def archive_file(source_file: Path, archive_dir: Path, target_name: Optional[str] = None) -> Optional[Path]:
     """
     Moves a processed file into the archive folder, handling filename collisions.
+    Optionally renames the file using target_name if provided.
     """
     archive_dir.mkdir(parents=True, exist_ok=True)
-    destination = archive_dir / source_file.name
+    file_name = target_name or source_file.name
+    destination = archive_dir / file_name
 
     if destination.exists():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        destination = archive_dir / f"{source_file.stem}_{timestamp}{source_file.suffix}"
+        destination = archive_dir / f"{destination.stem}_{timestamp}{destination.suffix}"
 
     try:
         shutil.move(str(source_file), str(destination))
@@ -1608,9 +1610,13 @@ def update_rides_catalog(backup_dir: Path, telemetry: RideTelemetry) -> None:
             with open(csv_path, mode="r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for r in reader:
+                    # Ignore empty entries or stray git merge conflict markers
+                    if not r or any(str(val or "").startswith(("<<<<<<<", "=======", ">>>>>>>")) for val in r.values()):
+                        continue
                     if (
-                        (telemetry.fit_filename and r.get("Fit Filename") == telemetry.fit_filename)
-                        or (telemetry.activity_id and r.get("ActivityID") == str(telemetry.activity_id))
+                        (telemetry.activity_id and r.get("ActivityID") == str(telemetry.activity_id))
+                        or (telemetry.fit_filename and r.get("Fit Filename") == telemetry.fit_filename)
+                        or (r.get("Date") == telemetry.date_str and r.get("Sport") == telemetry.sport)
                     ):
                         csv_rows.append(row_dict)
                         csv_updated = True
@@ -1645,8 +1651,9 @@ def update_rides_catalog(backup_dir: Path, telemetry: RideTelemetry) -> None:
 
     for idx, entry in enumerate(json_entries):
         if isinstance(entry, dict) and (
-            (telemetry.fit_filename and entry.get("Fit Filename") == telemetry.fit_filename)
-            or (telemetry.activity_id and entry.get("ActivityID") == str(telemetry.activity_id))
+            (telemetry.activity_id and entry.get("ActivityID") == str(telemetry.activity_id))
+            or (telemetry.fit_filename and entry.get("Fit Filename") == telemetry.fit_filename)
+            or (entry.get("Date") == telemetry.date_str and entry.get("Sport") == telemetry.sport)
         ):
             json_entries[idx] = row_dict
             json_updated = True
@@ -1779,6 +1786,57 @@ def git_backup_repository(
     return True
 
 
+def generate_backup_fit_filename(
+    date_str: str,
+    workout_name: str,
+    sport_name: str,
+    fallback_filename: str = "",
+) -> str:
+    """
+    Generates a unique, standardized, collision-free filename for backed-up FIT files.
+    Format: YYYYMMDD_HHMMSS_<slug>.fit
+    Example: 20261019_074156_ftp_test_mywhoosh.fit
+    """
+    # 1. Format timestamp prefix (YYYYMMDD_HHMMSS)
+    ts_prefix = ""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        ts_prefix = dt.strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        digits = re.sub(r"[^\d]", "", date_str or "")
+        if len(digits) >= 14:
+            ts_prefix = f"{digits[:8]}_{digits[8:14]}"
+        elif digits:
+            ts_prefix = digits
+        else:
+            ts_prefix = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 2. Derive descriptive slug
+    slug = ""
+    if workout_name:
+        cleaned = clean_extracted_name(workout_name)
+        if cleaned and not cleaned.lower().startswith("mywhoosh "):
+            # Strip date patterns if present in workout title
+            cleaned = re.sub(r"\b\d{4}[-_]\d{2}[-_]\d{2}(?:[-_ ]\d{2}[-_:]\d{2}[-_:]\d{2})?\b", "", cleaned)
+            slug = re.sub(r"[^a-zA-Z0-9]+", "_", cleaned.lower()).strip("_")
+
+    if not slug and sport_name:
+        s_val = re.sub(r"[^a-zA-Z0-9]+", "_", str(sport_name).strip().lower()).strip("_")
+        if s_val:
+            slug = s_val
+
+    if not slug and fallback_filename:
+        stem = Path(fallback_filename).stem
+        cleaned_stem = clean_extracted_name(stem)
+        if cleaned_stem:
+            slug = re.sub(r"[^a-zA-Z0-9]+", "_", cleaned_stem.lower()).strip("_")
+
+    if not slug:
+        slug = "activity"
+
+    return f"{ts_prefix}_{slug}.fit"
+
+
 def backup_and_index_ride(
     source_fit_path: Path,
     telemetry: RideTelemetry,
@@ -1788,7 +1846,7 @@ def backup_and_index_ride(
     original_fit_path: Optional[Path] = None,
 ) -> bool:
     """
-    Copies FIT file to structured year/month folder in the backup repo,
+    Copies FIT file to structured year/month folder in the backup repo with collision-free naming,
     optionally preserves the raw original MyWhoosh extract in 'raw/',
     updates catalog, and commits.
     """
@@ -1804,6 +1862,16 @@ def backup_and_index_ride(
             logger.warning(f"Could not create GIT_BACKUP_REPO_PATH '{repo_path}': {e}")
             return False
 
+    # Generate collision-free filename e.g. 20261019_074156_ftp_test_mywhoosh.fit
+    backup_filename = generate_backup_fit_filename(
+        date_str=telemetry.date_str,
+        workout_name=telemetry.workout_name,
+        sport_name=telemetry.sport,
+        fallback_filename=source_fit_path.name,
+    )
+    # Ensure telemetry reflects the unique backup filename in catalog & index
+    telemetry.fit_filename = backup_filename
+
     # Target folder:
     # If subdir_str == "auto": use telemetry.sport.lower() (e.g. 'cycling', 'rowing')
     # If subdir_str is custom: use that
@@ -1818,7 +1886,7 @@ def backup_and_index_ride(
 
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
-        dest_fit = target_dir / source_fit_path.name
+        dest_fit = target_dir / backup_filename
         shutil.copy2(str(source_fit_path), str(dest_fit))
         logger.info(f"Backed up ride FIT file to '{dest_fit}'.")
     except Exception as e:
@@ -1826,7 +1894,7 @@ def backup_and_index_ride(
         return False
 
     # Also back up the untouched original MyWhoosh extract to raw/{sport}/{year}/{month}/
-    if original_fit_path and original_fit_path.exists() and original_fit_path != source_fit_path:
+    if original_fit_path and original_fit_path.exists():
         try:
             raw_target_dir = repo_path / "raw"
             if subdir_str and subdir_str.lower() == "auto":
@@ -1835,12 +1903,11 @@ def backup_and_index_ride(
                 raw_target_dir = raw_target_dir / subdir_str
             raw_target_dir = raw_target_dir / telemetry.year / telemetry.month
             raw_target_dir.mkdir(parents=True, exist_ok=True)
-            dest_raw = raw_target_dir / original_fit_path.name
+            dest_raw = raw_target_dir / backup_filename
             shutil.copy2(str(original_fit_path), str(dest_raw))
             logger.info(f"Backed up raw untouched MyWhoosh extract to '{dest_raw}'.")
         except Exception as e:
             logger.warning(f"Failed to copy raw original FIT file to backup directory: {e}")
-
 
     # Update rides_summary.csv and rides_index.json
     try:
@@ -1997,7 +2064,7 @@ def main():
                     temp_output.unlink(missing_ok=True)
 
                 # Archive original workout file
-                archive_file(fit_path, archive_dir)
+                archive_file(fit_path, archive_dir, target_name=telemetry.fit_filename)
                 success_count += 1
             else:
                 logger.warning(f"File '{fit_path.name}' was not archived because upload failed.")
