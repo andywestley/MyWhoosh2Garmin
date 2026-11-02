@@ -14,7 +14,20 @@
       "garmin_email_env": "GARMIN_EMAIL",
       "garmin_password_env": "GARMIN_PASSWORD",
       "archive_subdir": "andrew"
+    },
+    "monty": {
+      "display_name": "Monty",
+      "mywhoosh_matches": [
+        "Monty",
+        "Monty Westley",
+        "montywestley@gmail.com"
+      ],
+      "ftp": 150,
+      "garmin_enabled": false,
+      "garmin_email": "montywestley@gmail.com",
+      "garmin_email_env": "GARMIN_EMAIL_MONTY",
+      "garmin_password_env": "GARMIN_PASSWORD_MONTY",
+      "archive_subdir": "monty"
     }
   }
 }
-

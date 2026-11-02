@@ -1059,7 +1059,7 @@ def list_all_mywhoosh_savegame_accounts(workout_dir: Optional[Path] = None) -> L
 
             if active_email:
                 act_name = email_to_name.get(active_email.lower(), names[0] if len(names) == 1 else "")
-                act_uuid = ach_uuids[0] if len(ach_uuids) == 1 else ""
+                act_uuid = ach_uuids[0] if (len(ach_uuids) == 1 and len(emails) <= 1) else ""
                 key = (active_email.lower(), act_name.lower())
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -1118,7 +1118,7 @@ def detect_active_mywhoosh_account(
 
     if accounts:
         primary = accounts[0]
-        if best_uuid and not primary.user_uuid:
+        if best_uuid and not primary.user_uuid and len(accounts) == 1:
             primary.user_uuid = best_uuid
         return primary
 
@@ -1171,13 +1171,14 @@ def resolve_workout_athlete(
 
     active_acct = detect_active_mywhoosh_account(workout_dir=workout_dir, fit_mtime=fit_mtime)
     if active_acct:
-        for prof in users.values():
-            if (
-                prof.matches_identifier(active_acct.email)
-                or prof.matches_identifier(active_acct.player_name)
-                or prof.matches_identifier(active_acct.user_uuid)
-            ):
-                return prof, f"MyWhoosh SaveGames ({active_acct.summary()})"
+        if active_acct.email or active_acct.player_name:
+            for prof in users.values():
+                if prof.matches_identifier(active_acct.email) or prof.matches_identifier(active_acct.player_name):
+                    return prof, f"MyWhoosh SaveGames ({active_acct.summary()})"
+        elif active_acct.user_uuid:
+            for prof in users.values():
+                if prof.matches_identifier(active_acct.user_uuid):
+                    return prof, f"MyWhoosh SaveGames ({active_acct.summary()})"
         # Active SaveGames account found, but does not match any configured user!
         return None, f"unconfigured MyWhoosh SaveGames account ({active_acct.summary()})"
 
@@ -2814,6 +2815,134 @@ def fix_recent_activity(target_activity_id: Optional[int] = None, user_id: str =
     return success
 
 
+def _enable_user_garmin_in_config(user_id: str) -> None:
+    """Sets garmin_enabled = true for user_id in users.json if currently false."""
+    if not USERS_CONFIG_PATH.exists():
+        return
+    try:
+        with open(USERS_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        users_dict = data.get("users", {})
+        if user_id in users_dict and not users_dict[user_id].get("garmin_enabled", False):
+            users_dict[user_id]["garmin_enabled"] = True
+            with open(USERS_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            logger.info(f"Automatically enabled 'garmin_enabled: true' for '{user_id}' in users.json.")
+    except Exception as e:
+        logger.debug(f"Could not update users.json for '{user_id}': {e}")
+
+
+def backfill_garmin_for_user(user_id: str) -> None:
+    """
+    Scans MyWhooshFitnessData/<user_id>/rides_index.json for workouts that were archived
+    while garmin_enabled was false (ActivityID == ""), uploads them to the user's Garmin Connect
+    account, enriches their metadata, and updates rides_index.json and rides_summary.csv.
+    """
+    users_map, _ = load_users_config()
+    uid = user_id.strip().lower()
+    if uid not in users_map:
+        logger.error(f"User '{uid}' not found in users.json. Available: {list(users_map.keys())}")
+        return
+
+    athlete = users_map[uid]
+    if not GIT_BACKUP_REPO_PATH:
+        logger.error("GIT_BACKUP_REPO_PATH is not configured in .env; cannot locate archived workouts to backfill.")
+        return
+
+    repo_path = Path(GIT_BACKUP_REPO_PATH).expanduser().resolve()
+    user_dir = repo_path / (athlete.archive_subdir or athlete.user_id)
+    json_path = user_dir / "rides_index.json"
+    if not json_path.is_file():
+        logger.info(f"No archived workouts index found at '{json_path}'. Nothing to backfill.")
+        return
+
+    try:
+        entries = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error(f"Failed to read '{json_path}': {e}")
+        return
+
+    pending_entries = [e for e in entries if isinstance(e, dict) and not str(e.get("ActivityID") or "").strip()]
+    if not pending_entries:
+        logger.info(f"All archived workouts for '{athlete.display_name}' ({uid}) already have Garmin Activity IDs.")
+        return
+
+    logger.info(f"Found {len(pending_entries)} archived workout(s) for '{athlete.display_name}' without Garmin Activity IDs.")
+    if not authenticate_to_garmin(athlete):
+        logger.error(f"Garmin authentication failed for '{athlete.display_name}'. Aborting backfill.")
+        return
+
+    updated_any = False
+    for entry in pending_entries:
+        fit_fname = entry.get("Fit Filename", "")
+        date_str = entry.get("Date", "")
+        sport_str = entry.get("Sport", "Cycling")
+        if not fit_fname or not date_str:
+            continue
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+
+        fit_candidate = user_dir / sport_str.lower() / dt.strftime("%Y") / dt.strftime("%m") / fit_fname
+        if not fit_candidate.is_file():
+            matches = list(user_dir.rglob(fit_fname))
+            non_raw = [m for m in matches if "raw" not in m.parts]
+            fit_candidate = non_raw[0] if non_raw else (matches[0] if matches else fit_candidate)
+
+        if not fit_candidate.is_file():
+            logger.warning(f"Could not find archived FIT file '{fit_fname}' in '{user_dir}'. Skipping.")
+            continue
+
+        ok, act_id = upload_fit_file_to_garmin(fit_candidate, expected_dt=dt)
+        if ok and act_id:
+            w_name = entry.get("Workout Name", "")
+            if UPDATE_GARMIN_METADATA:
+                update_garmin_activity_metadata(
+                    activity_id=act_id,
+                    workout_name=w_name,
+                    slug=generate_workout_slug(w_name),
+                    np_val=int(entry.get("NP (W)") or 0),
+                    if_val=float(entry.get("IF") or 0.0),
+                    tss_val=float(entry.get("TSS") or 0.0),
+                    work_kj=int(entry.get("Work (kJ)") or 0),
+                    append_url=APPEND_MYWHOOSHINFO_URL,
+                )
+            telem = RideTelemetry(
+                date_str=date_str,
+                activity_id=str(act_id),
+                sport=sport_str,
+                workout_name=w_name,
+                mywhooshinfo_url=entry.get("MyWhooshInfo URL", ""),
+                duration_sec=int(entry.get("Duration (s)") or 0),
+                distance_km=float(entry.get("Distance (km)") or 0.0),
+                avg_power=int(entry.get("Avg Power (W)") or 0),
+                np_power=int(entry.get("NP (W)") or 0),
+                max_power=int(entry.get("Max Power (W)") or 0),
+                avg_cadence=int(entry.get("Avg Cadence (RPM)") or 0),
+                avg_hr=int(entry.get("Avg HR (BPM)") or 0),
+                tss=float(entry.get("TSS") or 0.0),
+                intensity_factor=float(entry.get("IF") or 0.0),
+                work_kj=int(entry.get("Work (kJ)") or 0),
+                fit_filename=fit_fname,
+                year=dt.strftime("%Y"),
+                month=dt.strftime("%m"),
+                athlete_id=uid,
+            )
+            update_rides_catalog(user_dir, telem)
+            updated_any = True
+
+    if updated_any and ENABLE_GIT_BACKUP:
+        git_backup_repository(
+            repo_path=repo_path,
+            workout_name="Backfill Garmin Activity IDs",
+            ride_date_str=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            sport_name="backfill",
+            auto_push=GIT_AUTO_PUSH,
+            athlete=athlete,
+        )
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
@@ -2830,7 +2959,12 @@ if __name__ == "__main__":
             if target_uid not in users_map:
                 print(f"[ERROR] User '{target_uid}' not found in users.json. Available: {list(users_map.keys())}")
                 sys.exit(1)
-            authenticate_to_garmin(users_map[target_uid])
+            if authenticate_to_garmin(users_map[target_uid]):
+                _enable_user_garmin_in_config(target_uid)
+                backfill_garmin_for_user(target_uid)
+        elif cmd == "--backfill-garmin":
+            target_uid = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "monty"
+            backfill_garmin_for_user(target_uid)
         elif cmd == "--reprocess-unassigned":
             reprocess_unassigned_files()
         elif cmd == "--migrate-archive":
