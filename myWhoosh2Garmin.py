@@ -27,11 +27,13 @@ import warnings
 import re
 import csv
 import json
+import base64
+import struct
 import subprocess
 from datetime import datetime, timezone
 from getpass import getpass
 from typing import List, Optional, Tuple, Any, Dict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 # Suppress library deprecation notices in output
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -162,6 +164,57 @@ class RideTelemetry:
     fit_filename: str           # Source .fit filename
     year: str                   # "YYYY"
     month: str                  # "MM"
+    athlete_id: str = "andrew"  # Matched athlete identifier
+
+
+@dataclass
+class AthleteProfile:
+    """Configuration for an individual MyWhoosh athlete and their Garmin/archive settings."""
+    user_id: str
+    display_name: str
+    mywhoosh_matches: List[str] = field(default_factory=list)
+    ftp: int = 0
+    garmin_enabled: bool = True
+    garmin_email: str = ""
+    garmin_password: str = ""
+    archive_subdir: str = ""
+    token_dir: Path = field(default_factory=lambda: TOKENS_PATH)
+
+    def matches_identifier(self, candidate: Optional[str]) -> bool:
+        if not candidate:
+            return False
+        cand_clean = str(candidate).strip().lower()
+        if not cand_clean:
+            return False
+        targets = {
+            self.user_id.strip().lower(),
+            self.display_name.strip().lower(),
+        }
+        if self.garmin_email:
+            targets.add(self.garmin_email.strip().lower())
+        for m in self.mywhoosh_matches:
+            if m and str(m).strip():
+                targets.add(str(m).strip().lower())
+        return cand_clean in targets
+
+
+@dataclass
+class DetectedMyWhooshAccount:
+    """Represents a MyWhoosh account discovered from local SaveGames files."""
+    email: str = ""
+    player_name: str = ""
+    user_uuid: str = ""
+    source_file: str = ""
+
+    def summary(self) -> str:
+        parts = []
+        if self.player_name:
+            parts.append(f"name='{self.player_name}'")
+        if self.email:
+            parts.append(f"email='{self.email}'")
+        if self.user_uuid:
+            parts.append(f"uuid='{self.user_uuid}'")
+        return ", ".join(parts) if parts else "unknown"
 
 
 # Environment Configuration
@@ -784,50 +837,448 @@ def get_archive_location(workout_dir: Path) -> Path:
     return archive_path
 
 
-def authenticate_to_garmin() -> bool:
+USERS_CONFIG_PATH = SCRIPT_DIR / "users.json"
+
+
+def load_users_config(config_path: Optional[Path] = None) -> Tuple[Dict[str, AthleteProfile], str]:
     """
-    Authenticates to Garmin Connect using stored tokens or .env credentials.
+    Loads multi-user athlete profiles from users.json (with .env fallback if absent).
+    Returns (users_dict, unassigned_policy).
+    unassigned_policy is 'hold' (default: hold in Archive/unassigned) or 'default:<user_id>'.
     """
-    # Try resuming existing token session
-    if TOKENS_PATH.exists():
+    target_path = config_path or USERS_CONFIG_PATH
+    users: Dict[str, AthleteProfile] = {}
+    unassigned_policy = "hold"
+
+    if target_path.exists():
         try:
-            garth.resume(str(TOKENS_PATH))
-            username = getattr(garth.client, "username", None) or "User"
-            logger.info(f"Successfully resumed Garmin session for: {username}")
+            with open(target_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                unassigned_policy = str(data.get("unassigned_policy", "hold") or "hold").strip().lower()
+                raw_users = data.get("users", {})
+                if isinstance(raw_users, dict):
+                    for uid, ucfg in raw_users.items():
+                        if not isinstance(ucfg, dict):
+                            continue
+                        clean_id = str(uid).strip().lower()
+                        disp = str(ucfg.get("display_name") or uid).strip()
+                        matches = [str(m).strip() for m in ucfg.get("mywhoosh_matches", []) if str(m).strip()]
+                        try:
+                            u_ftp = int(ucfg.get("ftp") or 0)
+                        except (ValueError, TypeError):
+                            u_ftp = 0
+                        if u_ftp <= 0 and clean_id == "andrew" and ATHLETE_FTP > 0:
+                            u_ftp = ATHLETE_FTP
+
+                        g_enabled = bool(ucfg.get("garmin_enabled", True))
+                        email_env = str(ucfg.get("garmin_email_env") or "").strip()
+                        pass_env = str(ucfg.get("garmin_password_env") or "").strip()
+                        g_email = str(ucfg.get("garmin_email") or "").strip()
+                        g_pass = str(ucfg.get("garmin_password") or "").strip()
+                        if not g_email and email_env:
+                            g_email = _get_env_clean(email_env)
+                        if not g_pass and pass_env:
+                            g_pass = _get_env_clean(pass_env)
+
+                        subdir = str(ucfg.get("archive_subdir") or clean_id).strip()
+                        tok_dir = TOKENS_PATH / clean_id
+                        users[clean_id] = AthleteProfile(
+                            user_id=clean_id,
+                            display_name=disp,
+                            mywhoosh_matches=matches,
+                            ftp=u_ftp,
+                            garmin_enabled=g_enabled,
+                            garmin_email=g_email,
+                            garmin_password=g_pass,
+                            archive_subdir=subdir,
+                            token_dir=tok_dir,
+                        )
+        except Exception as e:
+            logger.warning(f"Failed to load '{target_path.name}': {e}. Falling back to .env profile.")
+
+    if not users:
+        default_id = (MYWHOOSH_PROFILE_NAME or "andrew").strip().lower()
+        default_disp = MYWHOOSH_PROFILE_NAME or "Andrew"
+        matches = [default_disp, "Andrew", "Andrew Westley", "andy@andrewwestley.co.uk"]
+        users[default_id] = AthleteProfile(
+            user_id=default_id,
+            display_name=default_disp,
+            mywhoosh_matches=matches,
+            ftp=ATHLETE_FTP,
+            garmin_enabled=True,
+            garmin_email=GARMIN_EMAIL,
+            garmin_password=GARMIN_PASSWORD,
+            archive_subdir=default_id,
+            token_dir=TOKENS_PATH / default_id,
+        )
+
+    return users, unassigned_policy
+
+
+def find_mywhoosh_savegames_dirs(workout_dir: Optional[Path] = None) -> List[Path]:
+    """
+    Locates MyWhoosh's 'Saved/SaveGames' directories across Windows Store, standard Windows, and macOS.
+    """
+    dirs: List[Path] = []
+    if workout_dir:
+        for cand in (
+            workout_dir / "SaveGames",
+            workout_dir.parent / "SaveGames",
+            workout_dir.parent.parent / "Saved" / "SaveGames",
+        ):
+            if cand.is_dir() and cand not in dirs:
+                dirs.append(cand)
+
+    if os.name == "nt":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            base_local = Path(local_app_data)
+            for std in ("MyWhoosh", "MyWhooshHD"):
+                p = base_local / std / "Saved" / "SaveGames"
+                if p.is_dir() and p not in dirs:
+                    dirs.append(p)
+            packages_path = base_local / "Packages"
+            if packages_path.is_dir():
+                try:
+                    for pkg in packages_path.iterdir():
+                        if pkg.is_dir() and pkg.name.startswith(MYWHOOSH_PREFIX_WINDOWS):
+                            p = pkg / "LocalCache" / "Local" / "MyWhoosh" / "Saved" / "SaveGames"
+                            if p.is_dir() and p not in dirs:
+                                dirs.append(p)
+                except Exception:
+                    pass
+    elif os.name == "posix":
+        for mp in (
+            Path.home()
+            / "Library"
+            / "Containers"
+            / "com.whoosh.whooshgame"
+            / "Data"
+            / "Library"
+            / "Application Support"
+            / "Epic"
+            / "MyWhoosh"
+            / "Saved"
+            / "SaveGames",
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "MyWhoosh"
+            / "Saved"
+            / "SaveGames",
+        ):
+            if mp.is_dir() and mp not in dirs:
+                dirs.append(mp)
+
+    return dirs
+
+
+def extract_gvas_str_properties(data: bytes, prop_name: str) -> List[str]:
+    """
+    Extracts Unreal Engine GVAS StrProperty values for a given property name from .sav binary data.
+    """
+    marker = prop_name.encode("ascii") + b"\x00\x0c\x00\x00\x00StrProperty\x00"
+    results: List[str] = []
+    idx = 0
+    while True:
+        pos = data.find(marker, idx)
+        if pos == -1:
+            break
+        val_offset = pos + len(marker) + 9
+        if val_offset + 4 <= len(data):
+            try:
+                (slen,) = struct.unpack_from("<i", data, val_offset)
+                if 0 < slen <= 1024 and val_offset + 4 + slen <= len(data):
+                    raw_bytes = data[val_offset + 4 : val_offset + 4 + slen]
+                    val = raw_bytes.rstrip(b"\x00").decode("utf-8", errors="ignore").strip()
+                    if val:
+                        results.append(val)
+            except Exception:
+                pass
+        idx = pos + len(marker)
+    return results
+
+
+def _decode_mywhoosh_email(raw_val: str) -> str:
+    """Decodes base64-encoded MyWhoosh playerEmail if encoded, else returns stripped string."""
+    val = (raw_val or "").strip()
+    if not val or "@" in val:
+        return val
+    try:
+        dec = base64.b64decode(val).decode("utf-8", errors="ignore").strip()
+        if "@" in dec:
+            return dec
+    except Exception:
+        pass
+    return val
+
+
+def list_all_mywhoosh_savegame_accounts(workout_dir: Optional[Path] = None) -> List[DetectedMyWhooshAccount]:
+    """
+    Scans MyWhoosh SaveGames (GameData.sav, OfflineData.sav, AchData-*.sav) and returns all
+    discovered accounts on this machine, with the currently active account listed first.
+    """
+    accounts: List[DetectedMyWhooshAccount] = []
+    seen_keys = set()
+
+    for sg_dir in find_mywhoosh_savegames_dirs(workout_dir):
+        # Collect UserId UUIDs from AchData-*.sav sorted by most recently modified
+        ach_uuids: List[str] = []
+        try:
+            ach_files = sorted(sg_dir.glob("AchData-*.sav"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for af in ach_files:
+                uids = extract_gvas_str_properties(af.read_bytes(), "UserId")
+                for u in uids:
+                    if u not in ach_uuids:
+                        ach_uuids.append(u)
+        except Exception:
+            pass
+
+        for sav_name in ("GameData.sav", "OfflineData.sav"):
+            sav_path = sg_dir / sav_name
+            if not sav_path.is_file():
+                continue
+            try:
+                raw = sav_path.read_bytes()
+            except Exception:
+                continue
+
+            cur_devs = extract_gvas_str_properties(raw, "CurrentDeviceId")
+            active_email = ""
+            if cur_devs and "::" in cur_devs[0]:
+                active_email = cur_devs[0].split("::", 1)[0].strip()
+
+            emails = [_decode_mywhoosh_email(e) for e in extract_gvas_str_properties(raw, "playerEmail")]
+            names = extract_gvas_str_properties(raw, "PlayerName")
+
+            email_to_name: Dict[str, str] = {}
+            for idx, em in enumerate(emails):
+                if em:
+                    email_to_name[em.lower()] = names[idx] if idx < len(names) else ""
+
+            if active_email:
+                act_name = email_to_name.get(active_email.lower(), names[0] if len(names) == 1 else "")
+                act_uuid = ach_uuids[0] if len(ach_uuids) == 1 else ""
+                key = (active_email.lower(), act_name.lower())
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    accounts.append(
+                        DetectedMyWhooshAccount(
+                            email=active_email,
+                            player_name=act_name,
+                            user_uuid=act_uuid,
+                            source_file=str(sav_path),
+                        )
+                    )
+
+            for idx, em in enumerate(emails):
+                pname = names[idx] if idx < len(names) else ""
+                key = (em.lower(), pname.lower())
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    accounts.append(
+                        DetectedMyWhooshAccount(
+                            email=em,
+                            player_name=pname,
+                            user_uuid=ach_uuids[0] if len(ach_uuids) == 1 and len(emails) == 1 else "",
+                            source_file=str(sav_path),
+                        )
+                    )
+
+    return accounts
+
+
+def detect_active_mywhoosh_account(
+    workout_dir: Optional[Path] = None, fit_mtime: Optional[float] = None
+) -> Optional[DetectedMyWhooshAccount]:
+    """
+    Determines the active MyWhoosh account from SaveGames at the time of the workout.
+    Also checks AchData-<UUID>.sav modification times closest to fit_mtime when multiple UUIDs exist.
+    """
+    accounts = list_all_mywhoosh_savegame_accounts(workout_dir)
+    best_uuid = ""
+    best_uuid_diff = float("inf")
+
+    for sg_dir in find_mywhoosh_savegames_dirs(workout_dir):
+        try:
+            for af in sg_dir.glob("AchData-*.sav"):
+                uids = extract_gvas_str_properties(af.read_bytes(), "UserId")
+                if not uids:
+                    continue
+                if fit_mtime is not None:
+                    diff = abs(af.stat().st_mtime - fit_mtime)
+                    if diff < best_uuid_diff:
+                        best_uuid_diff = diff
+                        best_uuid = uids[0]
+                elif not best_uuid:
+                    best_uuid = uids[0]
+        except Exception:
+            pass
+
+    if accounts:
+        primary = accounts[0]
+        if best_uuid and not primary.user_uuid:
+            primary.user_uuid = best_uuid
+        return primary
+
+    if best_uuid:
+        return DetectedMyWhooshAccount(user_uuid=best_uuid, source_file="AchData")
+
+    return None
+
+
+def resolve_workout_athlete(
+    fit_file: FitFile,
+    fit_path: Path,
+    users: Dict[str, AthleteProfile],
+    unassigned_policy: str = "hold",
+    workout_dir: Optional[Path] = None,
+) -> Tuple[Optional[AthleteProfile], str]:
+    """
+    Determines which configured AthleteProfile owns a given .fit workout file.
+    Priority order:
+      1. Parent subfolder or filename prefix (e.g. 'andrew__ride.fit' or 'Workouts/andrew/ride.fit')
+      2. Embedded FIT UserProfileMessage (friendly_name / name)
+      3. Active MyWhoosh SaveGames account (CurrentDeviceId email, PlayerName, or AchData UserId UUID)
+      4. Embedded FIT functional_threshold_power if uniquely matching one user (when SaveGames has no conflict)
+      5. Fallback policy (if SaveGames is absent in a standalone test environment or unassigned_policy='default:<id>')
+    Returns (matched_profile_or_None, match_description).
+    """
+    # 1. Explicit subfolder or filename prefix (<user_id>__ or <user_id>_)
+    parent_name = fit_path.parent.name.strip().lower()
+    if parent_name in users:
+        return users[parent_name], f"subfolder '{parent_name}'"
+
+    stem_lower = fit_path.stem.lower()
+    for uid, prof in users.items():
+        if stem_lower.startswith(f"{uid}__") or stem_lower.startswith(f"{uid}-"):
+            return prof, f"filename prefix '{uid}'"
+
+    # 2. Embedded FIT UserProfileMessage
+    fit_profile_name = extract_fit_profile_name(fit_file)
+    if fit_profile_name:
+        for prof in users.values():
+            if prof.matches_identifier(fit_profile_name):
+                return prof, f"FIT UserProfileMessage '{fit_profile_name}'"
+        return None, f"unrecognized FIT UserProfileMessage '{fit_profile_name}'"
+
+    # 3. MyWhoosh SaveGames active account inspection
+    try:
+        fit_mtime = fit_path.stat().st_mtime
+    except Exception:
+        fit_mtime = None
+
+    active_acct = detect_active_mywhoosh_account(workout_dir=workout_dir, fit_mtime=fit_mtime)
+    if active_acct:
+        for prof in users.values():
+            if (
+                prof.matches_identifier(active_acct.email)
+                or prof.matches_identifier(active_acct.player_name)
+                or prof.matches_identifier(active_acct.user_uuid)
+            ):
+                return prof, f"MyWhoosh SaveGames ({active_acct.summary()})"
+        # Active SaveGames account found, but does not match any configured user!
+        return None, f"unconfigured MyWhoosh SaveGames account ({active_acct.summary()})"
+
+    # 4. Embedded FIT FTP match (if unique)
+    file_ftp = extract_fit_ftp(fit_file)
+    if file_ftp and file_ftp > 0:
+        ftp_matches = [p for p in users.values() if p.ftp == file_ftp]
+        if len(ftp_matches) == 1:
+            return ftp_matches[0], f"embedded FIT FTP ({file_ftp}W)"
+
+    # 5. Policy fallback when no SaveGames or FIT profile exists (e.g. synthetic test files)
+    if unassigned_policy.startswith("default:"):
+        def_id = unassigned_policy.split(":", 1)[1].strip().lower()
+        if def_id in users:
+            return users[def_id], f"configured default user '{def_id}'"
+
+    if len(users) == 1 and active_acct is None:
+        only_user = next(iter(users.values()))
+        return only_user, f"single configured user fallback ('{only_user.user_id}')"
+
+    return None, "no matching athlete profile in FIT file or MyWhoosh SaveGames"
+
+
+def _ensure_user_token_dir(athlete: Optional[AthleteProfile]) -> Path:
+    """
+    Returns the Garth token directory for the given athlete.
+    If athlete is 'andrew' (or default) and .garth/andrew/ does not exist yet,
+    copies existing root .garth/*.json token files so existing sessions continue seamlessly.
+    """
+    if athlete is None:
+        return TOKENS_PATH
+
+    user_token_dir = athlete.token_dir
+    if not user_token_dir.exists() and TOKENS_PATH.is_dir():
+        root_oauth1 = TOKENS_PATH / "oauth1_token.json"
+        root_oauth2 = TOKENS_PATH / "oauth2_token.json"
+        if athlete.user_id == "andrew" and (root_oauth1.exists() or root_oauth2.exists()):
+            try:
+                user_token_dir.mkdir(parents=True, exist_ok=True)
+                for tf in (root_oauth1, root_oauth2):
+                    if tf.exists():
+                        shutil.copy2(str(tf), str(user_token_dir / tf.name))
+                logger.info(f"Migrated existing Garmin OAuth tokens into '{user_token_dir}'.")
+            except Exception as e:
+                logger.debug(f"Could not copy root tokens to '{user_token_dir}': {e}")
+
+    return user_token_dir
+
+
+def authenticate_to_garmin(athlete: Optional[AthleteProfile] = None) -> bool:
+    """
+    Authenticates to Garmin Connect for a specific AthleteProfile (or legacy default)
+    using isolated per-user token storage (.garth/<user_id>/) or .env credentials.
+    """
+    token_dir = _ensure_user_token_dir(athlete)
+    email = athlete.garmin_email if athlete else GARMIN_EMAIL
+    password = athlete.garmin_password if athlete else GARMIN_PASSWORD
+    label = f"{athlete.display_name} ({athlete.user_id})" if athlete else "default user"
+
+    # Try resuming existing token session
+    if token_dir.exists() and any(token_dir.glob("*.json")):
+        try:
+            garth.resume(str(token_dir))
+            username = getattr(garth.client, "username", None) or label
+            logger.info(f"Successfully resumed Garmin session for {label} (account: {username})")
             return True
         except (GarthException, Exception) as e:
-            logger.warning(f"Saved Garmin session token expired or invalid ({e}). Re-authenticating...")
+            logger.warning(f"Saved Garmin session token for {label} expired or invalid ({e}). Re-authenticating...")
 
-    # Authenticate with credentials from .env
-    if GARMIN_EMAIL and GARMIN_PASSWORD:
-        logger.info(f"Authenticating to Garmin Connect using credentials for: {GARMIN_EMAIL}")
+    # Authenticate with credentials from profile / .env
+    if email and password:
+        logger.info(f"Authenticating to Garmin Connect for {label} using email: {email}")
         try:
-            garth.login(GARMIN_EMAIL, GARMIN_PASSWORD)
-            garth.save(str(TOKENS_PATH))
-            logger.info("Successfully authenticated and saved Garmin session tokens.")
+            garth.login(email, password)
+            token_dir.mkdir(parents=True, exist_ok=True)
+            garth.save(str(token_dir))
+            logger.info(f"Successfully authenticated and saved Garmin session tokens for {label} in '{token_dir}'.")
             return True
         except GarthHTTPError as e:
-            logger.error(f"Authentication failed: Invalid Garmin credentials in .env ({e}).")
+            logger.error(f"Authentication failed for {label}: Invalid Garmin credentials ({e}).")
             return False
         except Exception as e:
-            logger.error(f"Unexpected authentication error: {e}")
+            logger.error(f"Unexpected authentication error for {label}: {e}")
             return False
 
     # Interactive Fallback if run manually from console
     if sys.stdin.isatty():
-        logger.info("No credentials in .env. Prompting for interactive login...")
+        logger.info(f"No stored token or credentials for {label}. Prompting for interactive login...")
         try:
-            username = input("Garmin Username/Email: ").strip()
-            password = getpass("Garmin Password: ")
-            garth.login(username, password)
-            garth.save(str(TOKENS_PATH))
-            logger.info("Successfully authenticated via interactive prompt.")
+            username = input(f"Garmin Username/Email for {label}: ").strip()
+            pwd = getpass(f"Garmin Password for {label}: ")
+            garth.login(username, pwd)
+            token_dir.mkdir(parents=True, exist_ok=True)
+            garth.save(str(token_dir))
+            logger.info(f"Successfully authenticated {label} via interactive prompt.")
             return True
         except Exception as e:
-            logger.error(f"Interactive authentication failed: {e}")
+            logger.error(f"Interactive authentication failed for {label}: {e}")
             return False
 
-    logger.error("Garmin authentication failed: No valid session token or .env credentials found.")
+    logger.error(f"Garmin authentication failed for {label}: No valid session token in '{token_dir}' or credentials found.")
     return False
 
 
@@ -927,11 +1378,14 @@ def clone_message(old_msg: object, msg_class: type) -> object:
 
 
 def process_and_spoof_fit_file(
-    input_fit_path: Path, output_fit_path: Path, expected_profile: Optional[str] = None
+    input_fit_path: Path,
+    output_fit_path: Path,
+    expected_profile: Optional[str] = None,
+    athlete: Optional[AthleteProfile] = None,
 ) -> Tuple[bool, Optional[RideTelemetry]]:
     """
     Parses, validates profile, calculates advanced cycling metrics (NP, IF, TSS, Work, FTP),
-    cleans up metrics, applies Garmin Edge 1030 Plus device spoofing, and extracts full ride telemetry.
+    cleans up metrics, applies Garmin Edge 1030 Plus / Fenix 7 device spoofing, and extracts full ride telemetry.
 
     Returns:
         (bool, Optional[RideTelemetry]): (True, telemetry) if successful, (False, None) otherwise.
@@ -942,8 +1396,8 @@ def process_and_spoof_fit_file(
         logger.error(f"Failed to read FIT file {input_fit_path.name}: {e}")
         return False, None
 
-    # Multi-User Profile Check
-    if expected_profile:
+    # Multi-User Profile Check (legacy expected_profile filter when called directly)
+    if expected_profile and athlete is None:
         file_profile = extract_fit_profile_name(fit_file)
         if file_profile:
             if file_profile.lower() != expected_profile.lower():
@@ -956,13 +1410,19 @@ def process_and_spoof_fit_file(
         else:
             logger.info(f"No athlete profile name embedded in {input_fit_path.name}. Proceeding with processing.")
 
-    # Determine FTP: Extract from FIT file if present, else fallback to ATHLETE_FTP from .env
+    # Determine FTP: Extract from FIT file if present, else athlete profile FTP, else ATHLETE_FTP from .env
     file_ftp = extract_fit_ftp(fit_file)
-    effective_ftp = file_ftp if file_ftp and file_ftp > 0 else ATHLETE_FTP
+    configured_ftp = athlete.ftp if (athlete and athlete.ftp > 0) else ATHLETE_FTP
+    effective_ftp = file_ftp if file_ftp and file_ftp > 0 else configured_ftp
     if effective_ftp > 0:
-        logger.info(f"Using FTP: {effective_ftp}W ({'from FIT file' if file_ftp else 'from .env'})")
+        ftp_source = (
+            "from FIT file"
+            if file_ftp
+            else (f"from user profile '{athlete.user_id}'" if athlete else "from .env")
+        )
+        logger.info(f"Using FTP: {effective_ftp}W ({ftp_source})")
     else:
-        logger.warning("No FTP configured or found in FIT file. Set ATHLETE_FTP in .env for TSS/IF calculations.")
+        logger.warning("No FTP configured or found in FIT file. Set ftp in users.json or ATHLETE_FTP in .env for TSS/IF calculations.")
 
     # Detect Sport & Dynamic Device Spoofing (e.g. Edge 1030 Plus for Cycling, Fenix 7 for Rowing)
     sport_name, sport_dir, spoof_product_id, spoof_product_name = extract_fit_sport(fit_file)
@@ -1329,6 +1789,7 @@ def process_and_spoof_fit_file(
         fit_filename=input_fit_path.name,
         year=ride_dt.strftime("%Y"),
         month=ride_dt.strftime("%m"),
+        athlete_id=athlete.user_id if athlete else "andrew",
     )
 
     return True, telemetry
@@ -1676,6 +2137,7 @@ def git_backup_repository(
     ride_date_str: str,
     sport_name: str = "activity",
     auto_push: bool = True,
+    athlete: Optional[AthleteProfile] = None,
 ) -> bool:
     """
     Performs non-blocking git add, commit, and push within the target backup repository.
@@ -1688,7 +2150,8 @@ def git_backup_repository(
         logger.warning(f"Git backup skipped: '{repo_path}' is not a git repository (missing .git).")
         return False
 
-    commit_msg = f"Auto-backup {sport_name.lower()}: {workout_name} ({ride_date_str})"
+    athlete_prefix = f"[{athlete.user_id}] " if athlete else ""
+    commit_msg = f"Auto-backup {athlete_prefix}{sport_name.lower()}: {workout_name} ({ride_date_str})"
 
     # 1. git pull (to sync any remote deletions or edits from GitHub)
     try:
@@ -1736,15 +2199,17 @@ def git_backup_repository(
         logger.warning(f"Failed to check git status in {repo_path}: {e}")
 
     # 3. git commit
+    author_name = (athlete.display_name if athlete else MYWHOOSH_PROFILE_NAME) or "MyWhoosh Sync"
+    author_email = (athlete.garmin_email if (athlete and athlete.garmin_email) else GARMIN_EMAIL) or "sync@mywhoosh2garmin.local"
     git_env = os.environ.copy()
     if "GIT_AUTHOR_NAME" not in git_env or not git_env.get("GIT_AUTHOR_NAME"):
-        git_env["GIT_AUTHOR_NAME"] = MYWHOOSH_PROFILE_NAME or "MyWhoosh Sync"
+        git_env["GIT_AUTHOR_NAME"] = author_name
     if "GIT_AUTHOR_EMAIL" not in git_env or not git_env.get("GIT_AUTHOR_EMAIL"):
-        git_env["GIT_AUTHOR_EMAIL"] = GARMIN_EMAIL or "sync@mywhoosh2garmin.local"
+        git_env["GIT_AUTHOR_EMAIL"] = author_email
     if "GIT_COMMITTER_NAME" not in git_env or not git_env.get("GIT_COMMITTER_NAME"):
-        git_env["GIT_COMMITTER_NAME"] = MYWHOOSH_PROFILE_NAME or "MyWhoosh Sync"
+        git_env["GIT_COMMITTER_NAME"] = author_name
     if "GIT_COMMITTER_EMAIL" not in git_env or not git_env.get("GIT_COMMITTER_EMAIL"):
-        git_env["GIT_COMMITTER_EMAIL"] = GARMIN_EMAIL or "sync@mywhoosh2garmin.local"
+        git_env["GIT_COMMITTER_EMAIL"] = author_email
 
     try:
         commit_res = subprocess.run(
@@ -1837,6 +2302,61 @@ def generate_backup_fit_filename(
     return f"{ts_prefix}_{slug}.fit"
 
 
+def migrate_legacy_backup_repo(repo_path: Path, default_user_subdir: str = "andrew") -> bool:
+    """
+    Migrates legacy root-level folders (cycling/, rowing/, raw/, rides_summary.csv, rides_index.json)
+    into a dedicated top-level user directory (e.g., MyWhooshFitnessData/andrew/).
+    Safe and idempotent: if root-level folders do not exist, does nothing.
+    """
+    if not repo_path.is_dir() or not default_user_subdir:
+        return False
+
+    user_root = repo_path / default_user_subdir
+    legacy_dirs = ["cycling", "rowing", "raw"]
+    legacy_files = ["rides_summary.csv", "rides_index.json"]
+
+    has_legacy = any((repo_path / d).is_dir() for d in legacy_dirs) or any(
+        (repo_path / f).is_file() for f in legacy_files
+    )
+    if not has_legacy:
+        return False
+
+    logger.info(f"Migrating root-level fitness archive data in '{repo_path}' into '{user_root}'...")
+    user_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. Move directory trees (cycling, rowing, raw)
+    for d_name in legacy_dirs:
+        src_dir = repo_path / d_name
+        if not src_dir.is_dir():
+            continue
+        dst_dir = user_root / d_name
+        if not dst_dir.exists():
+            shutil.move(str(src_dir), str(dst_dir))
+        else:
+            for item in src_dir.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(src_dir)
+                    target_f = dst_dir / rel
+                    target_f.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(item), str(target_f))
+            shutil.rmtree(str(src_dir), ignore_errors=True)
+
+    # 2. Move index files (rides_summary.csv, rides_index.json)
+    for f_name in legacy_files:
+        src_file = repo_path / f_name
+        if not src_file.is_file():
+            continue
+        dst_file = user_root / f_name
+        if not dst_file.exists():
+            shutil.move(str(src_file), str(dst_file))
+        else:
+            # Remove legacy root file if user_root already has one
+            src_file.unlink(missing_ok=True)
+
+    logger.info(f"Completed migration of legacy archive data to '{user_root}'.")
+    return True
+
+
 def backup_and_index_ride(
     source_fit_path: Path,
     telemetry: RideTelemetry,
@@ -1844,11 +2364,13 @@ def backup_and_index_ride(
     subdir_str: str,
     auto_push: bool = True,
     original_fit_path: Optional[Path] = None,
+    user_subdir: Optional[str] = None,
+    athlete: Optional[AthleteProfile] = None,
 ) -> bool:
     """
     Copies FIT file to structured year/month folder in the backup repo with collision-free naming,
-    optionally preserves the raw original MyWhoosh extract in 'raw/',
-    updates catalog, and commits.
+    optionally namespaces under a top-level user directory (e.g. 'andrew/', 'user2/'),
+    preserves the raw original MyWhoosh extract in 'raw/', updates catalog, and commits.
     """
     if not repo_path_str:
         logger.warning("Git ride backup skipped: GIT_BACKUP_REPO_PATH is not configured.")
@@ -1861,6 +2383,10 @@ def backup_and_index_ride(
         except Exception as e:
             logger.warning(f"Could not create GIT_BACKUP_REPO_PATH '{repo_path}': {e}")
             return False
+
+    # Base directory for this athlete (e.g. repo_path / 'andrew', or repo_path if user_subdir is None)
+    user_base_dir = (repo_path / user_subdir) if user_subdir else repo_path
+    user_base_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate collision-free filename e.g. 20261019_074156_ftp_test_mywhoosh.fit
     backup_filename = generate_backup_fit_filename(
@@ -1875,8 +2401,8 @@ def backup_and_index_ride(
     # Target folder:
     # If subdir_str == "auto": use telemetry.sport.lower() (e.g. 'cycling', 'rowing')
     # If subdir_str is custom: use that
-    # If subdir_str is empty/blank: use repo_path directly
-    target_dir = repo_path
+    # If subdir_str is empty/blank: use user_base_dir directly
+    target_dir = user_base_dir
     if subdir_str and subdir_str.lower() == "auto":
         target_dir = target_dir / telemetry.sport.lower()
     elif subdir_str:
@@ -1893,10 +2419,10 @@ def backup_and_index_ride(
         logger.warning(f"Failed to copy FIT file to backup directory '{target_dir}': {e}")
         return False
 
-    # Also back up the untouched original MyWhoosh extract to raw/{sport}/{year}/{month}/
+    # Also back up the untouched original MyWhoosh extract to {user_base_dir}/raw/{sport}/{year}/{month}/
     if original_fit_path and original_fit_path.exists():
         try:
-            raw_target_dir = repo_path / "raw"
+            raw_target_dir = user_base_dir / "raw"
             if subdir_str and subdir_str.lower() == "auto":
                 raw_target_dir = raw_target_dir / telemetry.sport.lower()
             elif subdir_str:
@@ -1909,13 +2435,13 @@ def backup_and_index_ride(
         except Exception as e:
             logger.warning(f"Failed to copy raw original FIT file to backup directory: {e}")
 
-    # Update rides_summary.csv and rides_index.json
+    # Update rides_summary.csv and rides_index.json inside user_base_dir
     try:
-        update_rides_catalog(repo_path, telemetry)
+        update_rides_catalog(user_base_dir, telemetry)
     except Exception as e:
-        logger.warning(f"Failed to update ride catalog in '{repo_path}': {e}")
+        logger.warning(f"Failed to update ride catalog in '{user_base_dir}': {e}")
 
-    # Automated git commit & push
+    # Automated git commit & push at the root of the git repository
     try:
         git_backup_repository(
             repo_path=repo_path,
@@ -1923,6 +2449,7 @@ def backup_and_index_ride(
             ride_date_str=telemetry.date_str,
             sport_name=telemetry.sport,
             auto_push=auto_push,
+            athlete=athlete,
         )
     except Exception as e:
         logger.warning(f"Git auto-backup encountered an error: {e}")
@@ -1933,7 +2460,8 @@ def backup_and_index_ride(
 
 def get_pending_fit_files(workout_dir: Path, archive_dir: Path) -> List[Path]:
     """
-    Discovers all candidate .fit files in the workout directory, ignoring the archive directory.
+    Discovers all candidate .fit files in the workout directory (and optional user subfolders),
+    ignoring the archive directory.
     """
     candidate_files = []
     for f in workout_dir.glob("*.fit"):
@@ -1977,7 +2505,20 @@ def main():
     # 0. Check for remote script updates
     auto_update_script_repo()
 
-    # 1. Discover Workout Path
+    # 1. Load Multi-User Profiles
+    users, unassigned_policy = load_users_config()
+    logger.info(
+        f"Loaded {len(users)} configured athlete profile(s): "
+        f"{', '.join(f'{u.display_name} ({u.user_id})' for u in users.values())}"
+    )
+
+    # Ensure legacy root archive repo is migrated into 'andrew/' if configured
+    if ENABLE_GIT_BACKUP and GIT_BACKUP_REPO_PATH:
+        repo_p = Path(GIT_BACKUP_REPO_PATH).expanduser().resolve()
+        if repo_p.is_dir():
+            migrate_legacy_backup_repo(repo_p, default_user_subdir="andrew")
+
+    # 2. Discover Workout Path
     workout_dir = get_fitfile_location()
     if not workout_dir:
         logger.error("Aborting sync: Workout directory not found.")
@@ -1992,45 +2533,93 @@ def main():
 
     logger.info(f"Found {len(pending_files)} pending workout file(s).")
 
-    # 2. Authenticate to Garmin
-    if not authenticate_to_garmin():
-        logger.error("Aborting sync: Authentication with Garmin Connect failed.")
-        sys.exit(1)
-
     # 3. Temporary processing directory
     temp_dir = SCRIPT_DIR / "temp_processing"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
+    unassigned_count = 0
+    active_garmin_user_id: Optional[str] = None
 
     try:
         for fit_path in pending_files:
             logger.info(f"Processing '{fit_path.name}'...")
             temp_output = temp_dir / fit_path.name
 
-            # Process, check athlete profile, extract telemetry, and spoof as Garmin Edge 1030 Plus
+            try:
+                raw_fit = FitFile.from_file(str(fit_path))
+            except Exception as e:
+                logger.error(f"Failed to read FIT file {fit_path.name}: {e}")
+                continue
+
+            # Resolve which athlete performed this workout
+            athlete, match_reason = resolve_workout_athlete(
+                fit_file=raw_fit,
+                fit_path=fit_path,
+                users=users,
+                unassigned_policy=unassigned_policy,
+                workout_dir=workout_dir,
+            )
+
+            if athlete is None:
+                unassigned_dir = archive_dir / "unassigned"
+                logger.warning(
+                    f"Unassigned workout '{fit_path.name}': {match_reason}. "
+                    f"Holding file in '{unassigned_dir}' (not uploading to Garmin). "
+                    f"Add this user to users.json and run 'python myWhoosh2Garmin.py --reprocess-unassigned'."
+                )
+                archive_file(fit_path, unassigned_dir)
+                unassigned_count += 1
+                continue
+
+            logger.info(
+                f"Matched workout '{fit_path.name}' -> Athlete '{athlete.display_name}' "
+                f"({athlete.user_id}) via {match_reason}."
+            )
+
+            # Process, calculate metrics using athlete's FTP, and spoof device
             processed, telemetry = process_and_spoof_fit_file(
                 input_fit_path=fit_path,
                 output_fit_path=temp_output,
-                expected_profile=MYWHOOSH_PROFILE_NAME if MYWHOOSH_PROFILE_NAME else None,
+                athlete=athlete,
             )
 
             if not processed or telemetry is None:
-                # File was skipped due to profile mismatch or parsing failure
                 if temp_output.exists():
                     temp_output.unlink(missing_ok=True)
                 continue
 
-            # Upload to Garmin Connect
-            ride_dt_obj = datetime.strptime(telemetry.date_str, "%Y-%m-%d %H:%M:%S")
-            upload_success, activity_id = upload_fit_file_to_garmin(temp_output, expected_dt=ride_dt_obj)
+            # Upload to Garmin Connect (if enabled for this athlete)
+            upload_success = False
+            activity_id: Optional[int] = None
+
+            if athlete.garmin_enabled:
+                if active_garmin_user_id != athlete.user_id:
+                    if not authenticate_to_garmin(athlete):
+                        logger.error(
+                            f"Skipping '{fit_path.name}': Garmin authentication failed for athlete "
+                            f"'{athlete.display_name}' ({athlete.user_id})."
+                        )
+                        if temp_output.exists():
+                            temp_output.unlink(missing_ok=True)
+                        continue
+                    active_garmin_user_id = athlete.user_id
+
+                ride_dt_obj = datetime.strptime(telemetry.date_str, "%Y-%m-%d %H:%M:%S")
+                upload_success, activity_id = upload_fit_file_to_garmin(temp_output, expected_dt=ride_dt_obj)
+            else:
+                logger.info(
+                    f"Garmin sync is disabled for athlete '{athlete.display_name}' ({athlete.user_id}). "
+                    "Skipping Garmin Connect upload and proceeding to archive backup."
+                )
+                upload_success = True
 
             if upload_success:
                 if activity_id:
                     telemetry.activity_id = str(activity_id)
 
                 # Enrich Garmin Activity metadata (Title, description with MyWhooshInfo and metrics)
-                if UPDATE_GARMIN_METADATA and activity_id:
+                if athlete.garmin_enabled and UPDATE_GARMIN_METADATA and activity_id:
                     update_garmin_activity_metadata(
                         activity_id=activity_id,
                         workout_name=telemetry.workout_name,
@@ -2042,7 +2631,7 @@ def main():
                         append_url=APPEND_MYWHOOSHINFO_URL,
                     )
 
-                # Automated GitHub Ride Backup & Telemetry Indexing
+                # Automated GitHub Ride Backup & Telemetry Indexing (under athlete's top-level folder)
                 if ENABLE_GIT_BACKUP:
                     if GIT_BACKUP_REPO_PATH:
                         backup_file_target = temp_output if temp_output.exists() else fit_path
@@ -2053,6 +2642,8 @@ def main():
                             subdir_str=GIT_BACKUP_SUBDIR,
                             auto_push=GIT_AUTO_PUSH,
                             original_fit_path=fit_path,
+                            user_subdir=athlete.archive_subdir or athlete.user_id,
+                            athlete=athlete,
                         )
                     else:
                         logger.warning("GitHub backup is enabled (ENABLE_GIT_BACKUP=true), but GIT_BACKUP_REPO_PATH is empty in .env. Skipping Git backup.")
@@ -2063,11 +2654,12 @@ def main():
                 if temp_output.exists():
                     temp_output.unlink(missing_ok=True)
 
-                # Archive original workout file
-                archive_file(fit_path, archive_dir, target_name=telemetry.fit_filename)
+                # Archive original workout file under Archive/<user_id>/
+                user_archive_dir = archive_dir / athlete.user_id
+                archive_file(fit_path, user_archive_dir, target_name=telemetry.fit_filename)
                 success_count += 1
             else:
-                logger.warning(f"File '{fit_path.name}' was not archived because upload failed.")
+                logger.warning(f"File '{fit_path.name}' was not archived because Garmin upload failed.")
                 if temp_output.exists():
                     temp_output.unlink(missing_ok=True)
 
@@ -2076,14 +2668,89 @@ def main():
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    logger.info(f"=== Sync Completed: {success_count} file(s) synced and archived. ===")
+    logger.info(
+        f"=== Sync Completed: {success_count} file(s) synced and archived, "
+        f"{unassigned_count} unassigned file(s) held. ==="
+    )
 
 
-def fix_recent_activity(target_activity_id: Optional[int] = None) -> bool:
+def print_user_detection_report() -> None:
+    """
+    CLI diagnostic (--detect-user / --list-users):
+    Displays configured users from users.json and all MyWhoosh accounts discovered in SaveGames.
+    """
+    users, policy = load_users_config()
+    workout_dir = get_fitfile_location()
+    accounts = list_all_mywhoosh_savegame_accounts(workout_dir)
+    active = detect_active_mywhoosh_account(workout_dir)
+
+    print("\n=== Configured Users (users.json) ===")
+    print(f"Unassigned Workout Policy: {policy}")
+    for uid, prof in users.items():
+        tok_status = "Saved" if (prof.token_dir.exists() and any(prof.token_dir.glob("*.json"))) else "Not Saved"
+        print(
+            f"  - [{uid}] {prof.display_name} | FTP={prof.ftp}W | "
+            f"Garmin={'Enabled' if prof.garmin_enabled else 'Disabled'} (Token: {tok_status}) | "
+            f"Archive='{prof.archive_subdir}/' | Matches={prof.mywhoosh_matches}"
+        )
+
+    print("\n=== Discovered MyWhoosh Accounts on This Machine (SaveGames) ===")
+    if not accounts:
+        print("  No MyWhoosh SaveGames accounts found.")
+    else:
+        for idx, acct in enumerate(accounts):
+            matched_uid = "UNASSIGNED"
+            for uid, prof in users.items():
+                if (
+                    prof.matches_identifier(acct.email)
+                    or prof.matches_identifier(acct.player_name)
+                    or prof.matches_identifier(acct.user_uuid)
+                ):
+                    matched_uid = f"Maps to -> [{uid}] ({prof.display_name})"
+                    break
+            active_tag = " [ACTIVE]" if (active and acct.email == active.email) else ""
+            print(f"  {idx + 1}. {acct.summary()}{active_tag}  -->  {matched_uid}")
+    print()
+
+
+def reprocess_unassigned_files() -> None:
+    """
+    Moves held .fit files from Archive/unassigned/ back into the workout directory and runs sync.
+    """
+    workout_dir = get_fitfile_location()
+    if not workout_dir:
+        logger.error("Cannot reprocess unassigned files: Workout directory not found.")
+        return
+    archive_dir = get_archive_location(workout_dir)
+    unassigned_dir = archive_dir / "unassigned"
+    if not unassigned_dir.is_dir():
+        print(f"No unassigned directory found at '{unassigned_dir}'.")
+        return
+
+    files = list(unassigned_dir.glob("*.fit"))
+    if not files:
+        print(f"No unassigned .fit files waiting in '{unassigned_dir}'.")
+        return
+
+    moved = 0
+    for f in files:
+        dest = workout_dir / f.name
+        if dest.exists():
+            dest = workout_dir / f"reprocess_{f.name}"
+        shutil.move(str(f), str(dest))
+        moved += 1
+    logger.info(f"Moved {moved} file(s) from '{unassigned_dir}' back to '{workout_dir}' for reprocessing.")
+    main()
+
+
+def fix_recent_activity(target_activity_id: Optional[int] = None, user_id: str = "andrew") -> bool:
     """
     Directly enriches an existing Garmin Connect activity with workout title & MyWhooshInfo details.
     Defaults to today's activity 24705575099 or the latest ride from the catalog.
     """
+    users, _ = load_users_config()
+    athlete = users.get(user_id.lower()) or next(iter(users.values()), None)
+
     act_id = target_activity_id or 24705575099
     name = "Endurance into Max Aerobic"
     slug = "endurance-into-max-aerobic"
@@ -2094,7 +2761,11 @@ def fix_recent_activity(target_activity_id: Optional[int] = None) -> bool:
 
     # If GIT_BACKUP_REPO_PATH is available, try reading entry from rides_index.json
     if GIT_BACKUP_REPO_PATH:
-        j_path = Path(GIT_BACKUP_REPO_PATH).expanduser().resolve() / "rides_index.json"
+        base_repo = Path(GIT_BACKUP_REPO_PATH).expanduser().resolve()
+        sub = athlete.archive_subdir if athlete else "andrew"
+        j_path = base_repo / sub / "rides_index.json"
+        if not j_path.exists():
+            j_path = base_repo / "rides_index.json"
         if j_path.exists():
             try:
                 with open(j_path, "r", encoding="utf-8") as f:
@@ -2120,7 +2791,7 @@ def fix_recent_activity(target_activity_id: Optional[int] = None) -> bool:
                 logger.debug(f"Could not load rides_index.json: {e}")
 
     logger.info(f"Connecting to Garmin to update activity {act_id} ('{name}')...")
-    if not authenticate_to_garmin():
+    if not authenticate_to_garmin(athlete):
         logger.error("Authentication to Garmin Connect failed.")
         return False
 
@@ -2144,11 +2815,34 @@ def fix_recent_activity(target_activity_id: Optional[int] = None) -> bool:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("--fix-today", "--fix-latest", "--update-activity"):
-        act_id = None
-        if len(sys.argv) > 2 and sys.argv[2].isdigit():
-            act_id = int(sys.argv[2])
-        fix_recent_activity(act_id)
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1].lower()
+        if cmd in ("--fix-today", "--fix-latest", "--update-activity"):
+            act_id = None
+            if len(sys.argv) > 2 and sys.argv[2].isdigit():
+                act_id = int(sys.argv[2])
+            fix_recent_activity(act_id)
+        elif cmd in ("--detect-user", "--list-users", "--users"):
+            print_user_detection_report()
+        elif cmd == "--auth":
+            users_map, _ = load_users_config()
+            target_uid = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "andrew"
+            if target_uid not in users_map:
+                print(f"[ERROR] User '{target_uid}' not found in users.json. Available: {list(users_map.keys())}")
+                sys.exit(1)
+            authenticate_to_garmin(users_map[target_uid])
+        elif cmd == "--reprocess-unassigned":
+            reprocess_unassigned_files()
+        elif cmd == "--migrate-archive":
+            target_repo = sys.argv[2] if len(sys.argv) > 2 else GIT_BACKUP_REPO_PATH
+            if not target_repo:
+                print("[ERROR] Specify repository path or set GIT_BACKUP_REPO_PATH in .env.")
+                sys.exit(1)
+            rp = Path(target_repo).expanduser().resolve()
+            if migrate_legacy_backup_repo(rp, default_user_subdir="andrew"):
+                git_backup_repository(rp, "Migrate root archive into andrew/", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "archive", auto_push=GIT_AUTO_PUSH)
+        else:
+            main()
     else:
         main()
 

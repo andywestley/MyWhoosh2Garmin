@@ -1,0 +1,42 @@
+{
+  "unassigned_policy": "hold",
+  "users": {
+    "andrew": {
+      "display_name": "Andrew",
+      "mywhoosh_matches": [
+        "Andrew",
+        "Andrew Westley",
+        "andy@andrewwestley.co.uk",
+        "f45ecfd1-c921-4482-b161-b2dfb1c6920d"
+      ],
+      "ftp": 160,
+      "garmin_enabled": true,
+      "garmin_email_env": "GARMIN_EMAIL",
+      "garmin_password_env": "GARMIN_PASSWORD",
+      "archive_subdir": "andrew"
+    },
+    "user2": {
+      "display_name": "User 2",
+      "mywhoosh_matches": [
+        "User 2 Display Name",
+        "user2@example.com"
+      ],
+      "ftp": 140,
+      "garmin_enabled": true,
+      "garmin_email_env": "GARMIN_EMAIL_USER2",
+      "garmin_password_env": "GARMIN_PASSWORD_USER2",
+      "archive_subdir": "user2"
+    },
+    "user3": {
+      "display_name": "User 3 (Archive Only)",
+      "mywhoosh_matches": [
+        "User 3 Display Name",
+        "user3@example.com"
+      ],
+      "ftp": 125,
+      "garmin_enabled": false,
+      "archive_subdir": "user3"
+    }
+  }
+}
+

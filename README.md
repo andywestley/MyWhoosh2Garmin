@@ -134,23 +134,53 @@ type sync.log
 
 ---
 
-## 📊 Telemetry Indexing & Backup Structure
+## 📊 Telemetry Indexing & Multi-User Backup Structure
 
-When `ENABLE_GIT_BACKUP=true` is set, rides are automatically archived into the target Git repository:
+When `ENABLE_GIT_BACKUP=true` is set, rides and rows are automatically archived into per-user top-level folders within the target Git repository:
 
 ```
 GIT_BACKUP_REPO_PATH/
-├── rides/
-│   └── 2026/
-│       └── 10/
-│           └── 2026-10-06-08-30-00.fit
-├── rides_summary.csv
-└── rides_index.json
+├── andrew/
+│   ├── cycling/2026/11/...
+│   ├── rowing/2026/10/...
+│   ├── raw/cycling/2026/11/...
+│   ├── rides_summary.csv
+│   └── rides_index.json
+└── user2/
+    ├── cycling/2026/11/...
+    ├── rowing/2026/11/...
+    ├── raw/...
+    ├── rides_summary.csv
+    └── rides_index.json
 ```
 
 ### `rides_summary.csv` Schema
-The catalog contains the following columns for easy spreadsheet and dashboard analysis:
-* `Date`, `ActivityID`, `Workout Name`, `MyWhooshInfo URL`, `Duration (s)`, `Distance (km)`, `Avg Power (W)`, `NP (W)`, `Max Power (W)`, `Avg Cadence (RPM)`, `Avg HR (BPM)`, `TSS`, `IF`, `Work (kJ)`, `Fit Filename`
+Each user's catalog contains the following columns for spreadsheet and dashboard analysis:
+* `Date`, `ActivityID`, `Sport`, `Workout Name`, `MyWhooshInfo URL`, `Duration (s)`, `Distance (km)`, `Avg Power (W)`, `NP (W)`, `Max Power (W)`, `Avg Cadence (RPM)`, `Avg HR (BPM)`, `TSS`, `IF`, `Work (kJ)`, `Fit Filename`
+
+---
+
+## 👥 Multi-User Routing & Account Setup (`users.json`)
+
+The sync engine supports multiple MyWhoosh users on the same computer:
+* **Automatic MyWhoosh Account Detection:** Reads both embedded FIT `UserProfileMessage` records and MyWhoosh's local `Saved/SaveGames/GameData.sav` (`CurrentDeviceId` email, `PlayerName`, and `AchData` `UserId` UUID) to determine which MyWhoosh user completed the workout.
+* **Per-User Garmin Accounts (or Archive-Only Users):** Each user in `users.json` can have their own Garmin Connect login (`garmin_enabled: true`, with isolated OAuth tokens stored in `.garth/<user_id>/`) or archive-only mode (`garmin_enabled: false`).
+* **Unassigned Safety Hold:** If a brand-new user logs into MyWhoosh before being added to `users.json`, their workout is safely held in `Archive/unassigned/` and will **never** be uploaded to another user's Garmin Connect account.
+
+### Helpful Multi-User CLI Commands
+```cmd
+# 1. Inspect MyWhoosh SaveGames to see all accounts that have logged in on this machine
+python myWhoosh2Garmin.py --detect-user
+
+# 2. Authenticate a specific user's Garmin Connect account (saves token to .garth/<user_id>/)
+python myWhoosh2Garmin.py --auth user2
+
+# 3. Reprocess workouts held in Archive/unassigned/ after adding the new user to users.json
+python myWhoosh2Garmin.py --reprocess-unassigned
+
+# 4. Migrate a legacy root-level backup repository into andrew/
+python myWhoosh2Garmin.py --migrate-archive
+```
 
 ---
 

@@ -2,6 +2,8 @@
 *.log
 *.json
 !workouts_catalog.json
+!users.json
+!users.example.json
 *.lock
 .env
 __pycache__/
