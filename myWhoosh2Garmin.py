@@ -2229,27 +2229,72 @@ def git_backup_repository(
         logger.warning(f"Failed to execute git commit in {repo_path}: {e}")
         return False
 
-    # 4. git push
+    # 4. git push with automatic retry on transient network/remote errors
     if auto_push:
-        try:
-            push_res = subprocess.run(
-                ["git", "push"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if push_res.returncode != 0:
-                logger.warning(
-                    f"git push failed in {repo_path} (offline or remote rejected): {push_res.stderr.strip()}"
+        for attempt in range(1, 4):
+            try:
+                push_res = subprocess.run(
+                    ["git", "push"],
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
-                return False
-            logger.info("Successfully pushed ride backup to remote git repository.")
-        except Exception as e:
-            logger.warning(f"Failed to execute git push in {repo_path}: {e}")
-            return False
+                if push_res.returncode == 0:
+                    logger.info("Successfully pushed ride backup to remote git repository.")
+                    return True
+                logger.warning(
+                    f"git push attempt {attempt}/3 failed in {repo_path} (offline or remote rejected): {push_res.stderr.strip()}"
+                )
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+            except Exception as e:
+                logger.warning(f"Failed to execute git push (attempt {attempt}/3) in {repo_path}: {e}")
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+        return False
 
     return True
+
+
+def sync_pending_git_backup(repo_path: Path, auto_push: bool = True) -> bool:
+    """
+    Checks if the backup repository has unpushed commits (e.g. from an earlier transient
+    network outage or remote server error) and automatically pushes them to the remote repository.
+    """
+    if not auto_push or not repo_path.is_dir() or not (repo_path / ".git").exists():
+        return False
+
+    try:
+        status_res = subprocess.run(
+            ["git", "status", "--porcelain", "-b"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_res.returncode == 0 and "[ahead " in status_res.stdout:
+            logger.info(f"Detected unpushed backup commits in '{repo_path}'. Catching up remote repository...")
+            for attempt in range(1, 4):
+                push_res = subprocess.run(
+                    ["git", "push"],
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if push_res.returncode == 0:
+                    logger.info("Successfully pushed pending backup commits to remote git repository.")
+                    return True
+                logger.warning(
+                    f"git push catch-up attempt {attempt}/3 failed in {repo_path}: {push_res.stderr.strip()}"
+                )
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+    except Exception as e:
+        logger.debug(f"Could not check or push pending backup commits in {repo_path}: {e}")
+
+    return False
 
 
 def generate_backup_fit_filename(
@@ -2513,11 +2558,13 @@ def main():
         f"{', '.join(f'{u.display_name} ({u.user_id})' for u in users.values())}"
     )
 
-    # Ensure legacy root archive repo is migrated into 'andrew/' if configured
+    # Ensure legacy root archive repo is migrated into 'andrew/' and catch up any unpushed backup commits
     if ENABLE_GIT_BACKUP and GIT_BACKUP_REPO_PATH:
         repo_p = Path(GIT_BACKUP_REPO_PATH).expanduser().resolve()
         if repo_p.is_dir():
             migrate_legacy_backup_repo(repo_p, default_user_subdir="andrew")
+            if GIT_AUTO_PUSH:
+                sync_pending_git_backup(repo_p, auto_push=True)
 
     # 2. Discover Workout Path
     workout_dir = get_fitfile_location()
